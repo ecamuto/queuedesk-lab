@@ -20,59 +20,63 @@ import (
 // per richiesta HTTP). Va bene perché r.pool è sicuro per l'uso concorrente
 // e il metodo non modifica campi di r: ogni chiamata ha la sua transazione.
 func (r *TicketRepo) ClaimTicket(ctx context.Context, id int64, agentID string) (ticket.Ticket, error) {
-	// TODO(CLAIM-1) — Il cuore del laboratorio: un claim con un solo vincitore.
-	//
-	// Dove serve: POST /v1/tickets/{id}/claim → Service.Claim (CLAIM-2) → qui.
-	// Più agent possono arrivare nello stesso istante, da goroutine diverse o
-	// da istanze diverse del servizio: la garanzia la dà PostgreSQL, non Go.
-	//
-	// Domanda guida, prima di scrivere: perché "SELECT assignee_id; se è NULL,
-	// UPDATE" non funziona con due agent simultanei? Disegnalo su una linea
-	// del tempo: entrambi leggono NULL, entrambi aggiornano, vincono in due.
-	//
-	// Passo A — Transazione:
-	//   1. tx, err := r.pool.Begin(ctx); errore →
-	//      fmt.Errorf("claim ticket: begin: %w", err);
-	//   2. defer tx.Rollback(ctx): annulla tutto su qualunque return d'errore;
-	//      dopo un Commit riuscito non fa nulla;
-	//   3. da qui in poi ogni query usa tx, mai r.pool: una query su r.pool
-	//      uscirebbe dalla transazione.
-	//
-	// Passo B — Un solo UPDATE atomico, senza SELECT preliminare:
-	//      t, err := scanTicket(tx.QueryRow(ctx, `
-	//          UPDATE tickets SET assignee_id = $2, updated_at = now()
-	//          WHERE id = $1 AND assignee_id IS NULL
-	//          RETURNING `+ticketColumns, id, agentID))
-	//   La condizione assignee_id IS NULL sta DENTRO l'UPDATE: chi arriva
-	//   secondo aspetta il lock della riga, poi PostgreSQL rivaluta la WHERE
-	//   sulla versione aggiornata e non trova nulla da aggiornare. RETURNING
-	//   dice subito se hai vinto (una riga) o perso (pgx.ErrNoRows).
-	//
-	// Passo C — Zero righe ha due cause, da distinguere SOLO adesso:
-	//   1. errors.Is(err, pgx.ErrNoRows) → nella stessa tx
-	//      SELECT EXISTS (SELECT 1 FROM tickets WHERE id = $1), Scan in un
-	//      bool; errore della query → "claim ticket: check existence: %w";
-	//   2. false → ticket.ErrNotFound (404); true → ticket.ErrAlreadyClaimed
-	//      (409). Restituiscili così come sono: li avvolge il service;
-	//   3. ogni altro errore dell'UPDATE → "claim ticket: update: %w".
-	//   Prima dell'UPDATE non serve nessuna query: leggere assignee_id e
-	//   decidere in Go riaprirebbe la race; un EXISTS preliminare sarebbe solo
-	//   una query in più anche per chi vince.
-	//
-	// Passo D — Audit e commit, solo per il vincitore:
-	//   1. insertEvent(ctx, tx, t.ID, agentID, ticket.EventClaimed,
-	//      map[string]string{"assignee_id": agentID}); errore →
-	//      "claim ticket: %w";
-	//   2. tx.Commit(ctx); errore → "claim ticket: commit: %w";
-	//   3. return t, nil.
-	//
-	// Rimuovi lo stub. Gli import "errors" e pgx restano: li usa anche
-	// UpdateStatus. Leggi UpdateStatus qui sotto: stesso problema, risolto con
-	// un lock pessimistico (SELECT ... FOR UPDATE) invece che con la WHERE.
-	// Fatto quando: make test-acceptance RUN='TestClaimConcurrentSingleWinner|TestClaimErrors'
-	// (richiede make db-up). Per stanare race intermittenti ripeti il test
-	// concorrente con -count=20: il comando è in TAPPA.md.
-	return ticket.Ticket{}, fmt.Errorf("TODO(CLAIM-1) ClaimTicket: %w", errors.ErrUnsupported)
+	// Go: Begin prende una connessione dal pool e apre una transazione; tx
+	// la rappresenta finché non chiamiamo Commit o Rollback.
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return ticket.Ticket{}, fmt.Errorf("claim ticket: begin: %w", err)
+	}
+	// Go: il defer garantisce il Rollback su OGNI return di errore qui sotto,
+	// senza ripeterlo in ogni ramo. Dopo un Commit riuscito Rollback non fa
+	// nulla (restituisce pgx.ErrTxClosed, che ignoriamo): per questo il suo
+	// errore non viene controllato.
+	defer tx.Rollback(ctx)
+
+	// Go: QueryRow non restituisce un errore subito: lo restituisce Scan
+	// (qui dentro scanTicket). Se la query non produce righe, Scan restituisce
+	// pgx.ErrNoRows. $1 e $2 sono parametri: i valori viaggiano separati dal
+	// testo SQL, quindi nessuna SQL injection. La backtick permette stringhe
+	// su più righe; "+ticketColumns" concatena una costante scritta da noi.
+	t, err := scanTicket(tx.QueryRow(ctx, `
+		UPDATE tickets
+		SET assignee_id = $2, updated_at = now()
+		WHERE id = $1 AND assignee_id IS NULL
+		RETURNING `+ticketColumns,
+		id, agentID))
+	// Go: errors.Is e non "err == pgx.ErrNoRows": pgx potrebbe restituire
+	// l'errore avvolto, ed errors.Is guarda tutta la catena.
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Zero righe: il ticket non esiste oppure è già assegnato.
+		//
+		// Go: "var exists bool" dichiara la variabile al valore zero (false).
+		// Scan(&exists) le passa l'indirizzo: Scan scrive lì il risultato.
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tickets WHERE id = $1)`, id).Scan(&exists); err != nil {
+			return ticket.Ticket{}, fmt.Errorf("claim ticket: check existence: %w", err)
+		}
+		if !exists {
+			// Errori di dominio restituiti così come sono: il service li
+			// avvolge con l'ID, l'HTTP li traduce in 404 e 409.
+			return ticket.Ticket{}, ticket.ErrNotFound
+		}
+		return ticket.Ticket{}, ticket.ErrAlreadyClaimed
+	}
+	if err != nil {
+		return ticket.Ticket{}, fmt.Errorf("claim ticket: update: %w", err)
+	}
+
+	// Go: insertEvent riceve tx (un pgx.Tx), non il pool: l'evento finisce
+	// nella stessa transazione dell'UPDATE. map[string]string{...} è una
+	// mappa letterale; insertEvent la serializza in JSON per la colonna JSONB.
+	if err := insertEvent(ctx, tx, t.ID, agentID, ticket.EventClaimed,
+		map[string]string{"assignee_id": agentID}); err != nil {
+		return ticket.Ticket{}, fmt.Errorf("claim ticket: %w", err)
+	}
+	// Solo qui assegnazione ed evento diventano visibili agli altri, insieme.
+	if err := tx.Commit(ctx); err != nil {
+		return ticket.Ticket{}, fmt.Errorf("claim ticket: commit: %w", err)
+	}
+	return t, nil
 }
 
 // UpdateStatus usa invece un lock pessimistico (SELECT ... FOR UPDATE):

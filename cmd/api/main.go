@@ -78,7 +78,39 @@ func run(log *slog.Logger) error {
 	defer pool.Close() // ultimo passo: dopo lo shutdown HTTP
 
 	authSvc := auth.NewService(postgres.NewUserRepo(pool), postgres.NewSessionRepo(pool), cfg.SessionTTL, time.Now)
-	ticketSvc := ticket.NewService(postgres.NewTicketRepo(pool), log)
+	// TODO(NOTIFY-5) — Collegare la coda di notifiche al servizio.
+	//
+	// Oggi ticket.NewService riceve nil: nessuna notifica. Nessun test
+	// automatico copre questo TODO: si verifica dal vivo (TAPPA.md).
+	//
+	// Passo A — Creare e avviare la coda, qui:
+	//   1. aggiungi l'import "queuedesk/internal/notify";
+	//   2. queue, err := notify.New(cfg.NotifyQueueSize, cfg.NotifyWorkers,
+	//          notify.LogHandler(log, 200*time.Millisecond), log)
+	//      errore → return err. I 200 ms simulano la latenza di un invio vero
+	//      (email, chat);
+	//   3. queue.Start(context.Background()). NON ctx: ctx viene cancellato al
+	//      primo Ctrl+C e i worker si fermerebbero subito invece di svuotare
+	//      la coda. Li ferma Shutdown, e solo alla deadline;
+	//   4. passa queue al posto di nil in ticket.NewService: *notify.Queue
+	//      soddisfa ticket.Publisher senza dichiararlo.
+	//
+	// Passo B — Chiuderla nello shutdown, nell'ordine giusto:
+	//   1. aggiungi il parametro queue *notify.Queue a shutdown e passalo
+	//      nella chiamata in fondo a run;
+	//   2. in shutdown, DOPO srv.Shutdown(ctx) e con lo stesso ctx, chiama
+	//      queue.Shutdown(ctx). Raccogli i due errori e restituiscili con
+	//      errors.Join, invece di uscire al primo: la coda va chiusa anche se
+	//      l'HTTP ha superato la deadline;
+	//   3. log.Info("shutdown complete", "notifications", queue.Stats()).
+	//   Perché quest'ordine? Le richieste HTTP ancora in corso possono
+	//   pubblicare: la coda deve restare aperta finché non sono finite. Il
+	//   pool del DB lo chiude il defer, per ultimo.
+	//
+	// Fatto quando: make test resta verde (i test di cmd/api avviano davvero
+	// run), un ticket creato produce "notification sent" nel log e Ctrl+C
+	// stampa "shutdown complete" con le statistiche.
+	ticketSvc := ticket.NewService(postgres.NewTicketRepo(pool), nil, log)
 	handler := httpapi.NewHandler(httpapi.Deps{Auth: authSvc, Tickets: ticketSvc, DB: pool, Logger: log})
 	srv := httpapi.NewServer(cfg.HTTPAddr, handler, log)
 

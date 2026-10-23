@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"queuedesk/internal/notify"
 )
 
 // Store è la persistenza richiesta dal service; internal/postgres la implementa.
@@ -31,21 +33,31 @@ type Store interface {
 	ListEvents(ctx context.Context, ticketID int64) ([]Event, error)
 }
 
+// Publisher accoda una notifica senza bloccare (implementato da notify.Queue).
+//
+// Go: un'interfaccia di un solo metodo. Il service non sa che dietro c'è un
+// worker pool: nei test si passa un fake che registra le chiamate.
+type Publisher interface {
+	TryPublish(n notify.Notification) error
+}
+
 // Service implementa i casi d'uso dei ticket.
 type Service struct {
 	store Store
+	pub   Publisher
 	log   *slog.Logger
 }
 
-// NewService crea il service.
+// NewService crea il service. pub può essere nil: nessuna notifica.
 //
-// Go: un logger nil manderebbe in panic al primo log: in quel caso usiamo
-// un logger che scarta tutto (stesso schema di httpapi.NewHandler).
-func NewService(store Store, log *slog.Logger) *Service {
+// Go: un valore di tipo interfaccia può essere nil. Va controllato prima di
+// chiamarne un metodo (lo fa publish): chiamare un metodo su un'interfaccia
+// nil è un panic.
+func NewService(store Store, pub Publisher, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Service{store: store, log: log}
+	return &Service{store: store, pub: pub, log: log}
 }
 
 // Create apre un ticket a nome di actor. Qualsiasi utente autenticato può
@@ -70,6 +82,21 @@ func (s *Service) Create(ctx context.Context, actor Actor, title, description st
 	if err != nil {
 		return Ticket{}, fmt.Errorf("create ticket: %w", err)
 	}
+	// TODO(NOTIFY-4) — Notificare la creazione, solo dopo il successo.
+	//
+	// Dove serve: s.publish (in fondo a questo file, già scritto) costruisce
+	// la notify.Notification per il reporter del ticket e chiama
+	// s.pub.TryPublish; con pub == nil, come in newService dei test, non fa
+	// nulla.
+	//
+	// Qui, dopo il controllo dell'errore dello store e prima del return:
+	//   s.publish(ctx, EventCreated, t, actor.UserID)
+	// Lo store ha già fatto commit: se avesse fallito non ci sarebbe nulla da
+	// notificare. publish non restituisce errori: coda piena o chiusa
+	// diventano un WARN nel log e la creazione resta riuscita (best effort).
+	// Lo stesso schema va in Claim e ChangeStatus (claim.go).
+	// Fatto quando: make test-acceptance RUN='TestPublishesAfterSuccess|TestNoPublishOnFailure|TestOperationsSucceedWhenQueueIsFull'
+	// (gli ultimi due sono verdi già con lo stub: devono restarlo).
 	return t, nil
 }
 
@@ -131,4 +158,28 @@ func (s *Service) Events(ctx context.Context, actor Actor, id int64) ([]Event, e
 		return nil, fmt.Errorf("list events of ticket %d: %w", id, err)
 	}
 	return evs, nil
+}
+
+// publish è best effort: viene chiamato dopo il commit e un fallimento
+// (coda piena o chiusa) viene solo registrato. La transazione resta valida.
+// Con un Publisher nil le notifiche sono disattivate (comodo nei test).
+//
+// Go: publish non restituisce un error di proposito. Un errore qui non deve
+// trasformare in fallimento un'operazione già salvata nel database.
+func (s *Service) publish(ctx context.Context, kind EventKind, t Ticket, actorID string) {
+	if s.pub == nil {
+		return
+	}
+	// Go: string(kind) converte il tipo con nome nella string sottostante:
+	// notify non conosce i tipi di ticket.
+	n := notify.Notification{
+		Kind:        string(kind),
+		TicketID:    t.ID,
+		ActorID:     actorID,
+		RecipientID: t.ReporterID,
+		Status:      string(t.Status),
+	}
+	if err := s.pub.TryPublish(n); err != nil {
+		s.log.WarnContext(ctx, "notification not queued", "kind", kind, "ticket_id", t.ID, "err", err)
+	}
 }

@@ -1,8 +1,3 @@
-//go:build acceptance
-
-// Acceptance test della tappa corrente: girano con `make test-acceptance`.
-// Falliscono finché i TODO della tappa non sono completati (vedi TAPPA.md).
-
 package ticket_test
 
 import (

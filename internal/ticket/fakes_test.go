@@ -132,5 +132,5 @@ func newService() (*ticket.Service, *fakeStore) {
 	st := newFakeStore()
 	// Go: due risultati: il service da testare e lo store, per preparare i
 	// dati e controllare le chiamate.
-	return ticket.NewService(st, nil), st
+	return ticket.NewService(st, nil, nil), st
 }
