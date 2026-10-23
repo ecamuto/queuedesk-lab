@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"time"
 )
@@ -16,35 +17,27 @@ const readyTimeout = 2 * time.Second
 // api, così può usare a.db e a.log. Il nome "_" per la richiesta dice che
 // non la usiamo.
 func (a *api) healthz(w http.ResponseWriter, _ *http.Request) {
-	// TODO(BASE-2, passo B) — Implementare la liveness.
-	//
-	// Contratto: rispondi HTTP 200 con JSON {"status":"ok"}. Non interrogare
-	// il database: questo endpoint dice solo che il processo è vivo.
-	//
-	// Usa writeJSON(w, http.StatusOK, ...) e una map[string]string.
-	// Rimuovi la risposta 501 provvisoria qui sotto.
-	// Fatto quando: make test-acceptance RUN=TestHealthz.
-	writeError(w, http.StatusNotImplemented, "not_implemented", "TODO(BASE-2): healthz")
+	// Go: map[string]string{"status": "ok"} è una mappa letterale;
+	// writeJSON la serializza in {"status":"ok"}.
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // readyz è la readiness: il servizio può gestire traffico (DB raggiungibile).
 func (a *api) readyz(w http.ResponseWriter, r *http.Request) {
-	// TODO(BASE-2, passo C) — Implementare la readiness.
-	//
-	// Contratto:
-	//   - DB raggiungibile     → 200, {"status":"ready"};
-	//   - DB non raggiungibile → log warning e 503 con codice "not_ready".
-	//
-	// Flusso:
-	//   1. crea da r.Context() un context con timeout readyTimeout;
-	//   2. usa defer cancel() per liberare il timer;
-	//   3. chiama a.db.Ping(ctx);
-	//   4. se Ping fallisce, registra "readiness check failed", scrivi
-	//      writeError(..., http.StatusServiceUnavailable, "not_ready",
-	//      "database not reachable") e fai return;
-	//   5. altrimenti usa writeJSON per la risposta 200.
-	//
-	// Aggiungi "context" agli import. Rimuovi la risposta 501 provvisoria.
-	// Fatto quando: make test-acceptance RUN=TestReadyz.
-	writeError(w, http.StatusNotImplemented, "not_implemented", "TODO(BASE-2): readyz")
+	// Go: context.WithTimeout crea un context figlio che scade dopo 2s e
+	// restituisce anche cancel, una funzione che lo libera prima. "defer"
+	// rimanda la chiamata a quando readyz termina, qualunque return si
+	// prenda: è il modo Go di non dimenticare la pulizia.
+	ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
+	defer cancel()
+
+	// a.db è un Pinger (interfaccia in server.go): qui non sappiamo, e non
+	// ci interessa, che dietro c'è *pgxpool.Pool. Nei test è fakePinger.
+	if err := a.db.Ping(ctx); err != nil {
+		// Go: i log strutturati di slog prendono coppie chiave, valore.
+		a.log.WarnContext(r.Context(), "readiness check failed", "err", err)
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "database not reachable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

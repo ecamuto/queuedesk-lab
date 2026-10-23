@@ -1,8 +1,3 @@
-//go:build acceptance
-
-// Acceptance test della tappa corrente: girano con `make test-acceptance`.
-// Falliscono finché i TODO della tappa non sono completati (vedi TAPPA.md).
-
 // Go: i file che finiscono in _test.go vengono compilati solo da `go test`.
 // "package config_test" (con _test) è un package separato: il test vede solo
 // ciò che config esporta, esattamente come un utente esterno.

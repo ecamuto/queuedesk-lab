@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"queuedesk/internal/auth"
 	"queuedesk/internal/config"
 	"queuedesk/internal/httpapi"
 	"queuedesk/internal/postgres"
@@ -75,57 +76,52 @@ func run(log *slog.Logger) error {
 	// questo, registrato dopo "defer stop()", gira prima di lui.
 	defer pool.Close() // ultimo passo: dopo lo shutdown HTTP
 
-	// Go: pool è un *pgxpool.Pool, ma il campo DB è di tipo httpapi.Pinger.
-	// Compila perché *pgxpool.Pool ha il metodo Ping(context.Context) error:
-	// l'interfaccia è soddisfatta implicitamente.
-	handler := httpapi.NewHandler(httpapi.Deps{DB: pool, Logger: log})
+	authSvc := auth.NewService(postgres.NewUserRepo(pool), postgres.NewSessionRepo(pool), cfg.SessionTTL, time.Now)
+	handler := httpapi.NewHandler(httpapi.Deps{Auth: authSvc, DB: pool, Logger: log})
 	srv := httpapi.NewServer(cfg.HTTPAddr, handler, log)
 
-	// TODO(BASE-4, passo A) — Avviare il server senza bloccare run.
-	//
-	// Problema: srv.ListenAndServe() blocca. Se lo chiami direttamente, run non
-	// arriva al codice che ascolta Ctrl+C. Servono due flussi concorrenti:
-	//
-	//   goroutine server ──errore──▶ serveErr ─┐
-	//                                         ├─▶ select ─▶ shutdown
-	//   SIGINT/SIGTERM ───────────▶ ctx.Done ─┘
-	//
-	// Implementazione, in ordine:
-	//   1. crea serveErr := make(chan error, 1); buffer 1 evita che la goroutine
-	//      resti bloccata se arriva contemporaneamente un segnale;
-	//   2. avvia una goroutine che registra "http server listening" e chiama
-	//      srv.ListenAndServe();
-	//   3. se l'errore NON è http.ErrServerClosed, invialo su serveErr;
-	//   4. chiudi serveErr quando la goroutine termina;
-	//   5. nel flusso principale usa select: errore da serveErr oppure segnale
-	//      da ctx.Done(). Salva l'eventuale errore in runErr con prefisso
-	//      "http server:"; sul segnale registra "shutdown signal received";
-	//   6. dopo il select chiama stop();
-	//   7. restituisci errors.Join(runErr,
-	//      shutdown(log, cfg.ShutdownTimeout, srv)).
-	//
-	// Rimuovi entrambe le righe provvisorie sotto. errors.Join ignora i nil.
-	// Fatto quando: TestRunGracefulShutdown e TestRunPortInUse passano.
-	_ = srv
-	return fmt.Errorf("TODO(BASE-4) serve: %w", errors.ErrUnsupported)
+	// Go: un canale (chan) è un tubo tipizzato fra goroutine. Con buffer 1
+	// la goroutine può depositare l'errore e terminare anche se nessuno lo
+	// sta ancora leggendo.
+	serveErr := make(chan error, 1)
+
+	// Go: "go f()" avvia f in una goroutine, cioè in parallelo, e prosegue
+	// subito. ListenAndServe blocca finché il server vive: se lo chiamassimo
+	// qui, run non arriverebbe mai al select che aspetta il segnale.
+	go func() {
+		log.Info("http server listening", "addr", cfg.HTTPAddr)
+		// Dopo srv.Shutdown, ListenAndServe restituisce sempre
+		// http.ErrServerClosed: non è un errore, è la chiusura normale.
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err // Go: "<-" invia sul canale
+		}
+		close(serveErr)
+	}()
+
+	// Go: select aspetta il primo fra più canali pronti ed esegue quel case.
+	var runErr error
+	select {
+	case err := <-serveErr: // es. porta già occupata
+		runErr = fmt.Errorf("http server: %w", err)
+	case <-ctx.Done(): // il canale si chiude al primo Ctrl+C o SIGTERM
+		log.Info("shutdown signal received")
+	}
+	stop() // un secondo Ctrl+C termina subito il processo
+
+	return errors.Join(runErr, shutdown(log, cfg.ShutdownTimeout, srv))
 }
 
 // shutdown smette di accettare richieste e attende quelle in corso, entro
 // la deadline. Il pool PostgreSQL viene chiuso dal defer in run, per ultimo.
 func shutdown(log *slog.Logger, timeout time.Duration, srv *http.Server) error {
-	// TODO(BASE-4, passo B) — Chiudere il server entro una deadline.
-	//
-	// Il context di run è già cancellato dal segnale: non riusarlo. Crea un
-	// context nuovo da context.Background(), con durata timeout.
-	//
-	// Poi:
-	//   1. defer cancel();
-	//   2. chiama srv.Shutdown(ctx);
-	//   3. se fallisce, restituisci fmt.Errorf("http shutdown: %w", err);
-	//   4. altrimenti registra "shutdown complete" e restituisci nil.
-	//
-	// Rimuovi entrambe le righe provvisorie sotto.
-	// Fatto quando: Ctrl+C chiude con exit 0 entro SHUTDOWN_TIMEOUT.
-	_, _, _ = log, timeout, srv
-	return fmt.Errorf("TODO(BASE-4) shutdown: %w", errors.ErrUnsupported)
+	// Un context NUOVO, con la sua deadline: quello di run è già stato
+	// cancellato dal segnale, e Shutdown non aspetterebbe nessuno.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		return fmt.Errorf("http shutdown: %w", err)
+	}
+	log.Info("shutdown complete")
+	return nil
 }

@@ -11,7 +11,18 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"queuedesk/internal/auth"
 )
+
+// AuthService è ciò che gli handler richiedono ad auth.Service.
+// Le interfacce sono dichiarate qui, dal chiamante, e restano piccole.
+type AuthService interface {
+	Register(ctx context.Context, email, password string) (auth.User, error)
+	Login(ctx context.Context, email, password string) (auth.LoginResult, error)
+	Authenticate(ctx context.Context, token string) (auth.Principal, error)
+	Logout(ctx context.Context, token string) error
+}
 
 // Pinger verifica la raggiungibilità del database (*pgxpool.Pool lo implementa).
 //
@@ -26,6 +37,7 @@ type Pinger interface {
 // Deps raccoglie le dipendenze degli handler. main la riempie con quelle
 // vere, i test con dei fake (vedi helpers_test.go).
 type Deps struct {
+	Auth   AuthService
 	DB     Pinger
 	Logger *slog.Logger
 }
@@ -33,12 +45,13 @@ type Deps struct {
 // api è il ricevitore di tutti gli handler: ogni metodo (a *api) vede le
 // dipendenze come campi. È privato: fuori dal package si usa NewHandler.
 type api struct {
-	db  Pinger
-	log *slog.Logger
+	auth AuthService
+	db   Pinger
+	log  *slog.Logger
 }
 
 // NewHandler registra le route e applica i middleware.
-// Ordine di esecuzione: requestID → log → recover → mux → handler.
+// Ordine di esecuzione: requestID → log → recover → mux → (requireAuth) → handler.
 func NewHandler(d Deps) http.Handler {
 	// Un logger nil manderebbe in panic al primo log: in quel caso usiamo
 	// un logger che scarta tutto.
@@ -46,22 +59,20 @@ func NewHandler(d Deps) http.Handler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	a := &api{db: d.DB, log: log}
+	a := &api{auth: d.Auth, db: d.DB, log: log}
 
 	// Go: il ServeMux sceglie l'handler in base a metodo e percorso.
 	// "GET /healthz" accetta solo GET: per gli altri metodi risponde da solo
 	// 405 Method Not Allowed. a.healthz senza parentesi è un "method value":
 	// la funzione healthz già legata ad a, passata come valore.
 	mux := http.NewServeMux()
-	// TODO(BASE-2, passo A) — Collegare URL e handler.
-	//
-	// Registra sul mux queste due associazioni:
-	//   - GET /healthz → a.healthz
-	//   - GET /readyz  → a.readyz
-	//
-	// Usa mux.HandleFunc. La stringa deve contenere anche "GET ": senza metodo
-	// la route accetterebbe POST; senza registrazione risponde 404.
-	// Fatto quando: TestHealthz non riceve più 404 e il POST riceve 405.
+	mux.HandleFunc("GET /healthz", a.healthz)
+	mux.HandleFunc("GET /readyz", a.readyz)
+
+	mux.HandleFunc("POST /v1/auth/register", a.register)
+	mux.HandleFunc("POST /v1/auth/login", a.login)
+	mux.Handle("DELETE /v1/auth/session", a.requireAuth(a.logout))
+	mux.Handle("GET /v1/me", a.requireAuth(a.me))
 
 	// Go: *http.ServeMux soddisfa l'interfaccia http.Handler (ha il metodo
 	// ServeHTTP). Ogni middleware avvolge il precedente: l'ultimo applicato

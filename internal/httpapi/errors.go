@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+
+	"queuedesk/internal/auth"
 )
 
 // errorBody ed errorDetail descrivono il JSON di errore:
@@ -54,6 +56,20 @@ func (a *api) respondErr(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.As(err, &reqErr):
 		writeError(w, reqErr.status, reqErr.code, reqErr.msg)
+
+	// 400: i messaggi di validazione sono scritti dai service e sicuri da mostrare.
+	case errors.Is(err, auth.ErrInvalidInput):
+		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
+
+	// 401
+	case errors.Is(err, auth.ErrInvalidCredentials):
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
+	case errors.Is(err, auth.ErrUnauthenticated):
+		a.unauthorized(w)
+
+	// 409
+	case errors.Is(err, auth.ErrEmailTaken):
+		writeError(w, http.StatusConflict, "email_taken", "email already registered")
 
 	// 501: le parti ancora da implementare (i TODO restituiscono
 	// errors.ErrUnsupported avvolto con l'ID del TODO).

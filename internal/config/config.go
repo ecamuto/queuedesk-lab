@@ -12,10 +12,12 @@ package config
 // Go: gli import standard e quelli del modulo stanno in un unico blocco.
 // Un import non usato è un errore di compilazione, non un warning.
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -87,28 +89,13 @@ func Load(getenv func(string) string) (Config, error) {
 	p.checkDatabaseURL(cfg.DatabaseURL)
 	p.checkAddr(cfg.HTTPAddr)
 
-	// TODO(BASE-1, passo C) — Restituire tutti gli errori di configurazione.
-	//
-	// Situazione attuale: se più variabili sono errate, questo blocco restituisce
-	// solo p.errs[0]. Chi avvia il servizio deve correggere un errore per volta.
-	//
-	// Risultato richiesto:
-	//   - nessun errore  → restituisci cfg, nil;
-	//   - uno o più errori → uniscili con errors.Join(p.errs...), aggiungi il
-	//     prefisso "invalid configuration:" e restituisci Config{} più l'errore.
-	//
-	// Passi:
-	//   1. aggiungi "errors" agli import;
-	//   2. chiama errors.Join(p.errs...);
-	//   3. se il risultato non è nil, avvolgilo con
-	//      fmt.Errorf("invalid configuration:\n%w", err);
-	//   4. sostituisci il blocco provvisorio qui sotto.
-	//
-	// Perché "p.errs...": ... espande la slice e passa ogni elemento come
-	// argomento separato a errors.Join.
-	// Fatto quando: TestLoadErrors mostra insieme DATABASE_URL e SESSION_TTL.
-	if len(p.errs) > 0 {
-		return Config{}, p.errs[0]
+	// Go: "if x := ...; cond {" dichiara x visibile solo dentro l'if.
+	// errors.Join unisce più errori in uno solo (nil se la lista è vuota).
+	// "p.errs..." espande la slice nei singoli argomenti della funzione.
+	if err := errors.Join(p.errs...); err != nil {
+		// Go: %w avvolge l'errore: il messaggio cambia, ma errors.Is ed
+		// errors.As ritrovano ancora quelli originali.
+		return Config{}, fmt.Errorf("invalid configuration:\n%w", err)
 	}
 	return cfg, nil
 }
@@ -172,40 +159,40 @@ func (p *parser) str(key, def string) string {
 // Go: "def, lo, hi time.Duration": parametri consecutivi dello stesso tipo
 // condividono la dichiarazione del tipo.
 func (p *parser) duration(key string, def, lo, hi time.Duration) time.Duration {
-	// TODO(BASE-1, passo A) — Leggere una durata opzionale dall'ambiente.
-	//
-	// Input: nome variabile, default e intervallo ammesso. Esempio:
-	// duration("SESSION_TTL", 24*time.Hour, time.Minute, 30*24*time.Hour).
-	//
-	// Gestisci questi casi, in ordine:
-	//   1. variabile vuota: restituisci def; non è un errore;
-	//   2. valore non interpretabile, es. "24": registra con p.fail
-	//      "%s: %q is not a duration (examples: 30s, 15m, 24h)" e restituisci 0;
-	//   3. durata fuori da [lo, hi]: registra con p.fail
-	//      "%s: %s is out of range [%s, %s]";
-	//   4. restituisci sempre la durata convertita nei casi 3 e 4.
-	//
-	// Usa time.ParseDuration(raw). p.fail accumula l'errore: non termina Load.
-	// Sostituisci il return provvisorio qui sotto.
-	// Fatto quando: make test-acceptance RUN=TestLoadCustomValues.
-	return def
+	raw := p.getenv(key)
+	if raw == "" {
+		return def
+	}
+	// Go: il pattern "valore, err := f(); if err != nil {...}" è il modo
+	// normale di gestire gli errori. Si controlla subito, poi si prosegue.
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		// %q stampa la stringa tra virgolette: si vedono anche gli spazi.
+		p.fail("%s: %q is not a duration (examples: 30s, 15m, 24h)", key, raw)
+		return 0 // il valore conta poco: Load fallirà comunque
+	}
+	if d < lo || d > hi {
+		p.fail("%s: %s is out of range [%s, %s]", key, d, lo, hi)
+	}
+	return d
 }
 
 // integer legge un intero e controlla che stia in [lo, hi].
 func (p *parser) integer(key string, def, lo, hi int) int {
-	// TODO(BASE-1, passo B) — Leggere un intero opzionale dall'ambiente.
-	//
-	// Non serve indovinare cosa significhi "come duration". I casi completi:
-	//   1. variabile vuota: restituisci def;
-	//   2. strconv.Atoi(raw) fallisce, es. "four": registra con p.fail
-	//      "%s: %q is not an integer" e restituisci 0;
-	//   3. valore fuori da [lo, hi]: registra con p.fail
-	//      "%s: %d is out of range [%d, %d]";
-	//   4. restituisci sempre l'intero convertito nei casi 3 e 4.
-	//
-	// Aggiungi "strconv" agli import e sostituisci il return provvisorio.
-	// Fatto quando: make test-acceptance RUN=TestLoadCustomValues.
-	return def
+	raw := p.getenv(key)
+	if raw == "" {
+		return def
+	}
+	// strconv.Atoi = "ASCII to integer": "8" diventa 8, "four" è un errore.
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		p.fail("%s: %q is not an integer", key, raw)
+		return 0
+	}
+	if n < lo || n > hi {
+		p.fail("%s: %d is out of range [%d, %d]", key, n, lo, hi)
+	}
+	return n
 }
 
 // checkDatabaseURL non include mai l'URL nei messaggi: può contenere la password.

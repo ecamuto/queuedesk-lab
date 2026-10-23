@@ -13,7 +13,7 @@ SEED_AGENT_PASSWORD ?= agent-demo-password
 TEST_DATABASE_URL   ?= postgres://queuedesk:queuedesk@localhost:55432/queuedesk_test?sslmode=disable
 BASE_URL            ?= http://localhost:8080
 
-.PHONY: help db-up db-down db-reset db-psql migrate-up migrate-down migrate-redo run build \
+.PHONY: help db-up db-down db-reset db-psql migrate-up migrate-down migrate-redo seed run build \
         fmt vet test test-race test-integration test-all cover check test-acceptance todo
 
 help: ## Mostra i target disponibili
@@ -44,6 +44,9 @@ migrate-redo: ## Riapplica l'ultima migrazione su DB di sviluppo e di test
 	go run ./cmd/migrate up
 	DATABASE_URL="$(TEST_DATABASE_URL)" go run ./cmd/migrate down
 	DATABASE_URL="$(TEST_DATABASE_URL)" go run ./cmd/migrate up
+
+seed: ## Crea l'agent demo (SEED_AGENT_EMAIL / SEED_AGENT_PASSWORD)
+	SEED_AGENT_PASSWORD="$(SEED_AGENT_PASSWORD)" go run ./cmd/seed -email "$(SEED_AGENT_EMAIL)"
 
 ## --- applicazione ---
 run: ## Avvia l'API (Ctrl+C per lo shutdown ordinato)

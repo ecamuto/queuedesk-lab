@@ -27,18 +27,12 @@ const requestIDKey ctxKey = 0
 
 // RequestIDFrom restituisce il request ID della richiesta corrente.
 func RequestIDFrom(ctx context.Context) string {
-	// TODO(BASE-3, passo A) — Leggere il request ID senza rischiare un panic.
-	//
-	// ctx.Value(requestIDKey) restituisce any. Converti il valore in string con
-	// la type assertion sicura a due risultati:
-	//
-	//     id, ok := valore.(string)
-	//
-	// Qui ok non serve e può diventare _. Se chiave manca o valore non è string,
-	// id deve restare "". Non usare l'assertion a un risultato: può fare panic.
-	// Sostituisci il return provvisorio.
-	// Fatto quando: TestRequestIDInLogs non produce panic anche senza request ID.
-	return ""
+	// Go: ctx.Value restituisce un valore di tipo any. ".(string)" è una
+	// type assertion: "dimmi se dentro c'è una string". Nella forma con due
+	// risultati (qui il secondo, ok, è scartato con _) non va mai in panic:
+	// se il valore manca o è di un altro tipo, id è "" (il valore zero).
+	id, _ := ctx.Value(requestIDKey).(string)
+	return id
 }
 
 const requestIDHeader = "X-Request-ID"
@@ -54,25 +48,20 @@ var validRequestID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 // requestID riusa l'X-Request-ID del client se ben formato, altrimenti ne
 // genera uno; lo rimanda nella risposta e lo salva nel context.
 func requestID(next http.Handler) http.Handler {
-	// TODO(BASE-3, passo B) — Costruire il middleware request ID.
-	//
-	// Modello mentale:
-	//
-	//   richiesta → requestID → next handler → risposta
-	//
-	// requestID deve restituire un http.HandlerFunc. Il codice dentro la
-	// funzione anonima gira una volta per richiesta e può chiamare next.
-	//
-	// Per ogni richiesta:
-	//   1. leggi X-Request-ID con r.Header.Get(requestIDHeader);
-	//   2. se non passa validRequestID, sostituiscilo con newRequestID();
-	//   3. mettilo nell'header della risposta;
-	//   4. aggiungilo al context con context.WithValue;
-	//   5. chiama next.ServeHTTP con r.WithContext(ctx), non con r originale.
-	//
-	// Sostituisci "return next": così com'è, il middleware non fa nulla.
-	// Fatto quando: make test-acceptance RUN=TestRequestID.
-	return next
+	// Go: http.HandlerFunc è un tipo funzione che implementa http.Handler.
+	// La funzione anonima qui sotto è una closure: "si ricorda" di next anche
+	// dopo che requestID è terminata, e la usa a ogni richiesta.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(requestIDHeader) // "" se l'header manca
+		if !validRequestID.MatchString(id) {
+			id = newRequestID()
+		}
+		w.Header().Set(requestIDHeader, id)
+		// Go: i context sono immutabili. WithValue ne crea uno nuovo che
+		// contiene anche id, e r.WithContext una copia della richiesta che
+		// lo usa. Gli handler successivi lo leggono con RequestIDFrom.
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey, id)))
+	})
 }
 
 // newRequestID genera 8 byte casuali in esadecimale (16 caratteri).
