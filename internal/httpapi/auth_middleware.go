@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 
 	"queuedesk/internal/auth"
 )
@@ -35,31 +37,23 @@ func principalFrom(ctx context.Context) (auth.Principal, bool) {
 // conversioni.
 func (a *api) requireAuth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// TODO(AUTH-4, passo B) — Proteggere la rotta con l'autenticazione.
-		//
-		// Dove serve: NewHandler (server.go) avvolge con requireAuth solo
-		// GET /v1/me e DELETE /v1/auth/session; register, login e health
-		// restano pubblici. Questa funzione gira una volta per richiesta,
-		// prima dell'handler. next è un http.HandlerFunc: si chiama next(w, r).
-		//
-		// Quattro esiti, ognuno con una sola risposta:
-		//   1. token, ok := bearerToken(r); !ok → a.unauthorized(w), return;
-		//   2. p, err := a.auth.Authenticate(r.Context(), token);
-		//      errors.Is(err, auth.ErrUnauthenticated) → a.unauthorized(w),
-		//      return;
-		//   3. qualsiasi altro errore → a.serverError(w, r, err), return. È un
-		//      500: il guasto è del server, e serverError ne logga il dettaglio;
-		//   4. successo: ctx := withPrincipal(r.Context(), p), poi
-		//      next(w, r.WithContext(ctx)). Passa la copia, non r: l'handler me
-		//      legge il principal con principalFrom.
-		//
-		// Senza return dopo un errore il codice prosegue e scrive una seconda
-		// risposta (nel log del server: "superfluous response.WriteHeader").
-		// Aggiungi "errors" agli import. Non loggare mai il token.
-		// Rimuovi `_ = next` e la risposta 501 provvisoria.
-		// Fatto quando: make test-acceptance RUN='TestRequireAuth|TestMe|TestLogout'.
-		_ = next
-		writeError(w, http.StatusNotImplemented, "not_implemented", "TODO(AUTH-4): requireAuth")
+		token, ok := bearerToken(r)
+		if !ok {
+			a.unauthorized(w)
+			return
+		}
+		p, err := a.auth.Authenticate(r.Context(), token)
+		switch {
+		case errors.Is(err, auth.ErrUnauthenticated):
+			a.unauthorized(w)
+			return
+		case err != nil:
+			a.serverError(w, r, err) // DB giù: 500, non 401
+			return
+		}
+		// Go: next è una funzione: la si chiama direttamente con (w, r).
+		// La richiesta passata è una copia con il principal nel context.
+		next(w, r.WithContext(withPrincipal(r.Context(), p)))
 	})
 }
 
@@ -68,27 +62,16 @@ const maxTokenLen = 128
 
 // bearerToken estrae il token da "Authorization: Bearer <token>".
 func bearerToken(r *http.Request) (string, bool) {
-	// TODO(AUTH-4, passo A) — Estrarre la credenziale Bearer.
-	//
-	// Dove serve: requireAuth (passo B), e l'handler logout, che la richiama
-	// per avere il token da revocare. Controlla solo il formato dell'header:
-	// non chiamare il service da qui.
-	//
-	//   1. header := r.Header.Get("Authorization"): "" se manca;
-	//   2. scheme, token, ok := strings.Cut(header, " "): divide al primo
-	//      spazio; ok è false se lo spazio non c'è (header vuoto o "Bearer");
-	//   3. !ok, oppure schema diverso da "Bearer" → return "", false.
-	//      Confronta con strings.EqualFold: lo schema HTTP non distingue le
-	//      maiuscole, quindi "bearer" è valido; "Basic ..." no;
-	//   4. token = strings.TrimSpace(token): toglie gli spazi in più;
-	//   5. return token, true solo se token != "" e len(token) <= maxTokenLen
-	//      (il token vero ha 43 caratteri: un header enorme non arriva al DB).
-	//      In tutti gli altri casi ok è false.
-	//
-	// Aggiungi "strings" agli import.
-	// Fatto quando: insieme al passo B, i casi "no header", "wrong scheme" ed
-	// "empty bearer" di TestRequireAuth ricevono 401 senza chiamare il service.
-	return "", false
+	// Go: strings.Cut divide la stringa al primo separatore e restituisce
+	// prima, dopo e se il separatore c'era. Più leggibile di Index + slicing.
+	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	// Go: EqualFold confronta ignorando maiuscole/minuscole: lo schema HTTP
+	// è case-insensitive ("bearer" va bene quanto "Bearer").
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	token = strings.TrimSpace(token)
+	return token, token != "" && len(token) <= maxTokenLen
 }
 
 // unauthorized risponde 401 con l'header WWW-Authenticate richiesto dallo

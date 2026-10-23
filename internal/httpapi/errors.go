@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"queuedesk/internal/auth"
+	"queuedesk/internal/ticket"
 )
 
 // errorBody ed errorDetail descrivono il JSON di errore:
@@ -58,7 +59,7 @@ func (a *api) respondErr(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, reqErr.status, reqErr.code, reqErr.msg)
 
 	// 400: i messaggi di validazione sono scritti dai service e sicuri da mostrare.
-	case errors.Is(err, auth.ErrInvalidInput):
+	case errors.Is(err, auth.ErrInvalidInput), errors.Is(err, ticket.ErrInvalidInput):
 		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
 
 	// 401
@@ -66,6 +67,10 @@ func (a *api) respondErr(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
 	case errors.Is(err, auth.ErrUnauthenticated):
 		a.unauthorized(w)
+
+	// 404
+	case errors.Is(err, ticket.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "ticket not found")
 
 	// 409
 	case errors.Is(err, auth.ErrEmailTaken):

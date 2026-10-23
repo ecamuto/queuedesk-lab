@@ -22,6 +22,7 @@ import (
 	"queuedesk/internal/config"
 	"queuedesk/internal/httpapi"
 	"queuedesk/internal/postgres"
+	"queuedesk/internal/ticket"
 )
 
 const dbConnectTimeout = 10 * time.Second
@@ -77,7 +78,8 @@ func run(log *slog.Logger) error {
 	defer pool.Close() // ultimo passo: dopo lo shutdown HTTP
 
 	authSvc := auth.NewService(postgres.NewUserRepo(pool), postgres.NewSessionRepo(pool), cfg.SessionTTL, time.Now)
-	handler := httpapi.NewHandler(httpapi.Deps{Auth: authSvc, DB: pool, Logger: log})
+	ticketSvc := ticket.NewService(postgres.NewTicketRepo(pool), log)
+	handler := httpapi.NewHandler(httpapi.Deps{Auth: authSvc, Tickets: ticketSvc, DB: pool, Logger: log})
 	srv := httpapi.NewServer(cfg.HTTPAddr, handler, log)
 
 	// Go: un canale (chan) è un tubo tipizzato fra goroutine. Con buffer 1

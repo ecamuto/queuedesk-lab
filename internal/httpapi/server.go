@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"queuedesk/internal/auth"
+	"queuedesk/internal/ticket"
 )
 
 // AuthService è ciò che gli handler richiedono ad auth.Service.
@@ -22,6 +23,14 @@ type AuthService interface {
 	Login(ctx context.Context, email, password string) (auth.LoginResult, error)
 	Authenticate(ctx context.Context, token string) (auth.Principal, error)
 	Logout(ctx context.Context, token string) error
+}
+
+// TicketService è ciò che gli handler richiedono a ticket.Service.
+type TicketService interface {
+	Create(ctx context.Context, actor ticket.Actor, title, description string) (ticket.Ticket, error)
+	List(ctx context.Context, actor ticket.Actor, q ticket.ListQuery) ([]ticket.Ticket, error)
+	Get(ctx context.Context, actor ticket.Actor, id int64) (ticket.Ticket, error)
+	Events(ctx context.Context, actor ticket.Actor, id int64) ([]ticket.Event, error)
 }
 
 // Pinger verifica la raggiungibilità del database (*pgxpool.Pool lo implementa).
@@ -37,17 +46,19 @@ type Pinger interface {
 // Deps raccoglie le dipendenze degli handler. main la riempie con quelle
 // vere, i test con dei fake (vedi helpers_test.go).
 type Deps struct {
-	Auth   AuthService
-	DB     Pinger
-	Logger *slog.Logger
+	Auth    AuthService
+	Tickets TicketService
+	DB      Pinger
+	Logger  *slog.Logger
 }
 
 // api è il ricevitore di tutti gli handler: ogni metodo (a *api) vede le
 // dipendenze come campi. È privato: fuori dal package si usa NewHandler.
 type api struct {
-	auth AuthService
-	db   Pinger
-	log  *slog.Logger
+	auth    AuthService
+	tickets TicketService
+	db      Pinger
+	log     *slog.Logger
 }
 
 // NewHandler registra le route e applica i middleware.
@@ -59,7 +70,7 @@ func NewHandler(d Deps) http.Handler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	a := &api{auth: d.Auth, db: d.DB, log: log}
+	a := &api{auth: d.Auth, tickets: d.Tickets, db: d.DB, log: log}
 
 	// Go: il ServeMux sceglie l'handler in base a metodo e percorso.
 	// "GET /healthz" accetta solo GET: per gli altri metodi risponde da solo
@@ -73,6 +84,11 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /v1/auth/login", a.login)
 	mux.Handle("DELETE /v1/auth/session", a.requireAuth(a.logout))
 	mux.Handle("GET /v1/me", a.requireAuth(a.me))
+
+	mux.Handle("POST /v1/tickets", a.requireAuth(a.createTicket))
+	mux.Handle("GET /v1/tickets", a.requireAuth(a.listTickets))
+	mux.Handle("GET /v1/tickets/{id}", a.requireAuth(a.getTicket))
+	mux.Handle("GET /v1/tickets/{id}/events", a.requireAuth(a.ticketEvents))
 
 	// Go: *http.ServeMux soddisfa l'interfaccia http.Handler (ha il metodo
 	// ServeHTTP). Ogni middleware avvolge il precedente: l'ultimo applicato

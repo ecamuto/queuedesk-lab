@@ -87,99 +87,73 @@ func (s *Service) Register(ctx context.Context, email, password string) (User, e
 // email o password produce lo stesso ErrInvalidCredentials, così il client
 // non può distinguere "utente inesistente" da "password errata".
 func (s *Service) Login(ctx context.Context, email, password string) (LoginResult, error) {
-	// TODO(AUTH-2) — Verificare le credenziali e creare una sessione.
-	//
-	// Dove serve: l'handler POST /v1/auth/login (auth_handlers.go) passa qui
-	// email e password. respondErr (errors.go) traduce ErrInvalidCredentials
-	// in 401 invalid_credentials e ogni errore non riconosciuto in 500.
-	//
-	// Regola: ogni fallimento imputabile al client restituisce ESATTAMENTE
-	// ErrInvalidCredentials, non avvolto (il test confronta con ==): il client
-	// non deve capire se l'email esiste. I guasti di store, hashing o
-	// generazione del token restano errori interni: fmt.Errorf("login: %w", err).
-	//
-	// Passo A — Normalizzazione e ricerca utente:
-	//   1. email, err := NormalizeEmail(email) (riassegna il parametro);
-	//   2. errore → return LoginResult{}, ErrInvalidCredentials. Non
-	//      ErrInvalidInput: diventerebbe 400 e rivelerebbe il motivo;
-	//   3. creds, err := s.users.CredentialsByEmail(ctx, email);
-	//   4. errors.Is(err, ErrNotFound) → esegui comunque
-	//      _ = CheckPassword(dummyHash, password), poi restituisci
-	//      ErrInvalidCredentials. Senza il confronto fittizio un'email
-	//      inesistente risponderebbe molto prima (timing side channel);
-	//   5. ogni altro errore dello store → fmt.Errorf("login: %w", err).
-	//
-	// Passo B — Verifica password:
-	//   1. CheckPassword(creds.PasswordHash, password): nil se corrisponde;
-	//   2. errors.Is(err, ErrInvalidCredentials) → restituisci
-	//      ErrInvalidCredentials, il valore originale e non err avvolto;
-	//   3. ogni altro errore (hash corrotto nel DB) → "login: %w".
-	//
-	// Passo C — Creazione sessione, solo dopo una password corretta:
-	//   1. token, hash, err := NewToken(); errore → "login: %w";
-	//   2. now := s.now().UTC(), non time.Now(): i test iniettano un orologio
-	//      fisso e confrontano gli istanti esatti;
-	//   3. costruisci Session con TokenHash hash, UserID creds.ID, CreatedAt
-	//      now ed ExpiresAt now.Add(s.ttl), poi s.sessions.CreateSession;
-	//   4. errore di salvataggio → "login: %w";
-	//   5. return LoginResult{Token: token, ExpiresAt: <ExpiresAt della
-	//      sessione>}, nil.
-	//
-	// Il token in chiaro esce soltanto nel risultato: non salvarlo, non
-	// loggarlo. Rimuovi lo stub; "errors" resta negli import per errors.Is.
-	// Fatto quando: make test-acceptance RUN='^TestLogin'.
-	// TestLoginStoreFailureIsNotACredentialError è verde già con lo stub:
-	// deve restarlo anche dopo.
-	return LoginResult{}, fmt.Errorf("TODO(AUTH-2) Login: %w", errors.ErrUnsupported)
+	email, err := NormalizeEmail(email)
+	if err != nil {
+		return LoginResult{}, ErrInvalidCredentials
+	}
+
+	creds, err := s.users.CredentialsByEmail(ctx, email)
+	// Go: lo switch senza espressione separa i tre esiti: utente assente,
+	// errore tecnico (DB giù: va a 500, non a 401), e successo, che esce
+	// dallo switch senza entrare in nessun case.
+	switch {
+	case errors.Is(err, ErrNotFound):
+		// Stesso costo di bcrypt anche quando l'utente non esiste.
+		// Go: "_ =" scarta il risultato in modo esplicito: qui conta solo
+		// il tempo speso, non l'esito.
+		_ = CheckPassword(dummyHash, password)
+		return LoginResult{}, ErrInvalidCredentials
+	case err != nil:
+		return LoginResult{}, fmt.Errorf("login: %w", err)
+	}
+
+	if err := CheckPassword(creds.PasswordHash, password); err != nil {
+		if errors.Is(err, ErrInvalidCredentials) {
+			return LoginResult{}, ErrInvalidCredentials
+		}
+		return LoginResult{}, fmt.Errorf("login: %w", err)
+	}
+
+	// Go: tre risultati in un colpo solo; il token in chiaro esiste solo in
+	// questa variabile e nella risposta al client.
+	token, hash, err := NewToken()
+	if err != nil {
+		return LoginResult{}, fmt.Errorf("login: %w", err)
+	}
+	// Go: time.Time contiene anche il fuso. UTC() lo normalizza, così le
+	// date salvate e restituite non dipendono dal fuso della macchina.
+	// Add somma una time.Duration e restituisce un nuovo time.Time.
+	now := s.now().UTC()
+	sess := Session{TokenHash: hash, UserID: creds.ID, CreatedAt: now, ExpiresAt: now.Add(s.ttl)}
+	if err := s.sessions.CreateSession(ctx, sess); err != nil {
+		return LoginResult{}, fmt.Errorf("login: %w", err)
+	}
+	return LoginResult{Token: token, ExpiresAt: sess.ExpiresAt}, nil
 }
 
 // Authenticate risolve un bearer token nel principal corrispondente.
 // Token vuoto, sconosciuto, scaduto o revocato producono ErrUnauthenticated.
 func (s *Service) Authenticate(ctx context.Context, token string) (Principal, error) {
-	// TODO(AUTH-3, passo A) — Risolvere il token in un'identità.
-	//
-	// Dove serve: requireAuth (AUTH-4) chiama Authenticate a ogni richiesta
-	// protetta, con il token letto dall'header Authorization.
-	//
-	//   1. token == "" → return Principal{}, ErrUnauthenticated, senza
-	//      interrogare lo store;
-	//   2. lo store conosce solo l'hash: cerca con HashToken(token);
-	//   3. p, err := s.sessions.PrincipalBySession(ctx, hash, s.now().UTC()).
-	//      La scadenza la controlla lo store (valida solo se expires_at > now):
-	//      qui non confrontare date;
-	//   4. errors.Is(err, ErrNotFound) significa token sconosciuto, scaduto o
-	//      revocato, casi che il client non deve distinguere: restituisci
-	//      ErrUnauthenticated, che HTTP mapperà a 401;
-	//   5. ogni altro errore è tecnico: fmt.Errorf("authenticate: %w", err),
-	//      che diventerà 500;
-	//   6. altrimenti return p, nil.
-	//
-	// Non trasformare un DB irraggiungibile in 401: il client crederebbe
-	// scaduta una sessione valida e disconnetterebbe l'utente.
-	// Prerequisiti: AUTH-1 e AUTH-2, perché il test fa prima un Login.
-	// Fatto quando: make test-acceptance RUN='^TestAuthenticate'.
-	// TestAuthenticateStoreFailureIsInternal è verde già con lo stub: deve
-	// restarlo anche dopo.
-	return Principal{}, fmt.Errorf("TODO(AUTH-3) Authenticate: %w", errors.ErrUnsupported)
+	if token == "" {
+		return Principal{}, ErrUnauthenticated // inutile interrogare il DB
+	}
+	// Al DB arriva solo l'hash: è l'unica cosa che vi è salvata.
+	p, err := s.sessions.PrincipalBySession(ctx, HashToken(token), s.now().UTC())
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return Principal{}, ErrUnauthenticated
+	case err != nil:
+		return Principal{}, fmt.Errorf("authenticate: %w", err)
+	}
+	return p, nil
 }
 
 // Logout revoca la sessione associata al token. È idempotente.
 func (s *Service) Logout(ctx context.Context, token string) error {
-	// TODO(AUTH-3, passo B) — Revocare la sessione.
-	//
-	// Dove serve: DELETE /v1/auth/session, dietro requireAuth: quando si
-	// arriva qui il token è già stato verificato.
-	//
-	//   1. s.sessions.DeleteSession(ctx, HashToken(token)): passa l'hash, mai
-	//      il token in chiaro;
-	//   2. errore → fmt.Errorf("logout: %w", err); altrimenti return nil.
-	//
-	// Non controllare se la sessione esisteva: DeleteSession è idempotente, e
-	// un secondo logout (doppio clic, retry di rete) deve riuscire.
-	// Rimuovi lo stub.
-	// Fatto quando: make test-acceptance RUN=TestLogoutRevokesSession; poi
-	// RUN=TestAuthServiceWithPostgres prova AUTH-1..3 su PostgreSQL vero.
-	return fmt.Errorf("TODO(AUTH-3) Logout: %w", errors.ErrUnsupported)
+	if err := s.sessions.DeleteSession(ctx, HashToken(token)); err != nil {
+		return fmt.Errorf("logout: %w", err)
+	}
+	return nil
 }
 
 // NormalizeEmail rifiuta indirizzi non validi o con display name
