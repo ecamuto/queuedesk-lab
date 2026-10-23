@@ -1,0 +1,25 @@
+name: queuedesk-laboratorio
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: queuedesk
+      POSTGRES_PASSWORD: queuedesk
+      POSTGRES_DB: queuedesk
+      TZ: UTC
+    ports:
+      # Porta non standard per non scontrarsi con un PostgreSQL locale
+      # né con altri progetti del corso.
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queuedesk -d queuedesk"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:
