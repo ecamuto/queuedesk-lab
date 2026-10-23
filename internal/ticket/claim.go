@@ -56,15 +56,14 @@ func CanTransition(from, to Status) bool {
 // arrivare anche da più istanze del servizio.
 func (s *Service) Claim(ctx context.Context, actor Actor, id int64) (Ticket, error) {
 	if !actor.IsAgent {
-		return Ticket{}, ErrForbidden
+		return Ticket{}, ErrForbidden // prima il ruolo: un requester non tocca lo store
 	}
 	t, err := s.store.ClaimTicket(ctx, id, actor.UserID)
 	if err != nil {
+		// %w: ErrAlreadyClaimed e ErrNotFound restano riconoscibili.
 		return Ticket{}, fmt.Errorf("claim ticket %d: %w", id, err)
 	}
-	// TODO(NOTIFY-4) — Dopo il successo: s.publish(ctx, EventClaimed, t, actor.UserID).
-	// Solo qui, dopo il controllo dell'errore: chi perde il claim (409) o non
-	// ha il ruolo (403) non deve generare notifiche.
+	s.publish(ctx, EventClaimed, t, actor.UserID)
 	return t, nil
 }
 
@@ -73,6 +72,8 @@ func (s *Service) ChangeStatus(ctx context.Context, actor Actor, id int64, statu
 	if !actor.IsAgent {
 		return Ticket{}, ErrForbidden
 	}
+	// Go: il valore del client arriva come string e diventa uno Status solo
+	// dopo la validazione: dallo store in giù circolano solo stati validi.
 	to, err := ParseStatus(status)
 	if err != nil {
 		return Ticket{}, err
@@ -81,8 +82,6 @@ func (s *Service) ChangeStatus(ctx context.Context, actor Actor, id int64, statu
 	if err != nil {
 		return Ticket{}, fmt.Errorf("change status of ticket %d: %w", id, err)
 	}
-	// TODO(NOTIFY-4) — Dopo il successo: s.publish(ctx, EventStatusChanged, t, actor.UserID).
-	// t arriva dallo store con il nuovo stato: publish lo copia in
-	// Notification.Status. Un cambio rifiutato non notifica nulla.
+	s.publish(ctx, EventStatusChanged, t, actor.UserID)
 	return t, nil
 }

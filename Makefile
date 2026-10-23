@@ -14,7 +14,7 @@ TEST_DATABASE_URL   ?= postgres://queuedesk:queuedesk@localhost:55432/queuedesk_
 BASE_URL            ?= http://localhost:8080
 
 .PHONY: help db-up db-down db-reset db-psql migrate-up migrate-down migrate-redo seed run build \
-        fmt vet test test-race test-integration test-all cover check test-acceptance todo
+        fmt vet test test-race test-integration test-all cover smoke check test-acceptance todo
 
 help: ## Mostra i target disponibili
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-17s\033[0m %s\n", $$1, $$2}'
@@ -87,3 +87,7 @@ test-acceptance: ## Acceptance test dei TODO; filtra con RUN=TestNome (richiede 
 
 todo: ## Elenca i TODO del laboratorio ancora presenti
 	@grep -rn --include='*.go' --include='*.sql' 'TODO(' . | sed 's|^\./||'
+
+## --- demo ---
+smoke: ## Demo end-to-end con curl (richiede make run e make seed)
+	BASE_URL="$(BASE_URL)" SEED_AGENT_EMAIL="$(SEED_AGENT_EMAIL)" SEED_AGENT_PASSWORD="$(SEED_AGENT_PASSWORD)" ./scripts/smoke.sh

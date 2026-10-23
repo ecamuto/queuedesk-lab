@@ -33,12 +33,53 @@ func badRequest(code, format string, args ...any) error {
 	return &requestError{status: http.StatusBadRequest, code: code, msg: fmt.Sprintf(format, args...)}
 }
 
-// decodeJSON legge un oggetto JSON nel tipo dst.
-//
-// Versione minima: accetta qualsiasi Content-Type, body di qualunque
-// dimensione, campi sconosciuti e dati in coda. Verrà resa robusta nella
-// tappa 6 (ROB-1).
+// decodeJSON legge esattamente un oggetto JSON nel tipo dst.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	// TODO(ROB-1) — Un body, un oggetto JSON: controllato prima di usarlo.
+	//
+	// Dove serve: ogni handler con un body (register, login, creazione del
+	// ticket, cambio di stato) chiama decodeJSON. Questa versione accetta
+	// qualunque Content-Type, ignora i campi sconosciuti (il "role":"agent"
+	// nella register passa in silenzio), legge solo il primo valore e non ha
+	// limiti di dimensione.
+	//
+	// Passo A — Content-Type, prima di leggere il body:
+	//   mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"));
+	//   se err != nil oppure mt != "application/json" → return
+	//   &requestError{status: http.StatusUnsupportedMediaType,
+	//   code: "unsupported_media_type", msg: "Content-Type must be application/json"}.
+	//   Non badRequest, che darebbe 400. ParseMediaType separa i parametri:
+	//   "application/json; charset=utf-8" → "application/json"; un header
+	//   assente è una stringa vuota → err. Va fatto prima del Decode: un form
+	//   (email=a&password=b) darebbe altrimenti 400 invalid_json, non 415.
+	//
+	// Passo B — Limite e decoder, in quest'ordine:
+	//   r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	//   dec := json.NewDecoder(r.Body)
+	//   dec.DisallowUnknownFields()
+	//   Il decoder va creato dopo aver sostituito r.Body, altrimenti legge il
+	//   body originale, senza limite. w serve a MaxBytesReader: superato il
+	//   limite, chiede al server di chiudere la connessione.
+	//
+	// Passo C — Il primo valore: dec.Decode(dst); se err → return
+	// jsonError(err). jsonError, già scritto qui sotto, traduce ogni caso:
+	// sintassi, tipo sbagliato, body vuoto, campo sconosciuto (400
+	// unknown_field), *http.MaxBytesError (413 body_too_large).
+	//
+	// Passo D — Nient'altro dopo il primo valore. Decode legge un valore e si
+	// ferma: {…}{…} e {…} x passerebbero. Un secondo dec.Decode(&struct{}{})
+	// deve restituire io.EOF (controlla con errors.Is):
+	//   - se l'errore è un *http.MaxBytesError (errors.As) → return
+	//     jsonError(err): il limite è stato superato dopo il primo oggetto, 413;
+	//   - qualunque altro esito, nil compreso (c'era un secondo oggetto) →
+	//     return badRequest("invalid_json", "body must contain a single JSON object").
+	// dec.More() non basta: non vede un "}" o un "]" di troppo.
+	//
+	// Rimuovi "_ = w" e il Decode provvisorio; aggiungi "mime" agli import.
+	// Fatto quando: make test-acceptance RUN=TestDecodeJSONHardening è verde
+	// (7 subtest rossi → 0; "charset parameter accepted" e "array instead of
+	// object" sono verdi già con lo stub). Dal vivo, make smoke passa da
+	// "27 ok, 2 falliti" a "29 ok, 0 falliti".
 	_ = w
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		return jsonError(err)

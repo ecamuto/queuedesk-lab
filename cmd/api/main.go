@@ -21,11 +21,15 @@ import (
 	"queuedesk/internal/auth"
 	"queuedesk/internal/config"
 	"queuedesk/internal/httpapi"
+	"queuedesk/internal/notify"
 	"queuedesk/internal/postgres"
 	"queuedesk/internal/ticket"
 )
 
-const dbConnectTimeout = 10 * time.Second
+const (
+	dbConnectTimeout    = 10 * time.Second
+	notificationLatency = 200 * time.Millisecond // latenza simulata dell'invio
+)
 
 // main resta minuscola: crea il logger, chiama run e trasforma un errore in
 // exit code 1. Tutta la logica sta in run, che restituisce un error e quindi
@@ -75,42 +79,18 @@ func run(log *slog.Logger) error {
 	}
 	// Go: i defer girano all'uscita da run in ordine inverso (LIFO):
 	// questo, registrato dopo "defer stop()", gira prima di lui.
-	defer pool.Close() // ultimo passo: dopo lo shutdown HTTP
+	defer pool.Close() // ultimo passo: dopo HTTP e notifiche
+
+	queue, err := notify.New(cfg.NotifyQueueSize, cfg.NotifyWorkers, notify.LogHandler(log, notificationLatency), log)
+	if err != nil {
+		return err
+	}
+	// Non ctx: i worker non devono fermarsi al segnale ma svuotare la coda
+	// durante queue.Shutdown.
+	queue.Start(context.Background())
 
 	authSvc := auth.NewService(postgres.NewUserRepo(pool), postgres.NewSessionRepo(pool), cfg.SessionTTL, time.Now)
-	// TODO(NOTIFY-5) — Collegare la coda di notifiche al servizio.
-	//
-	// Oggi ticket.NewService riceve nil: nessuna notifica. Nessun test
-	// automatico copre questo TODO: si verifica dal vivo (TAPPA.md).
-	//
-	// Passo A — Creare e avviare la coda, qui:
-	//   1. aggiungi l'import "queuedesk/internal/notify";
-	//   2. queue, err := notify.New(cfg.NotifyQueueSize, cfg.NotifyWorkers,
-	//          notify.LogHandler(log, 200*time.Millisecond), log)
-	//      errore → return err. I 200 ms simulano la latenza di un invio vero
-	//      (email, chat);
-	//   3. queue.Start(context.Background()). NON ctx: ctx viene cancellato al
-	//      primo Ctrl+C e i worker si fermerebbero subito invece di svuotare
-	//      la coda. Li ferma Shutdown, e solo alla deadline;
-	//   4. passa queue al posto di nil in ticket.NewService: *notify.Queue
-	//      soddisfa ticket.Publisher senza dichiararlo.
-	//
-	// Passo B — Chiuderla nello shutdown, nell'ordine giusto:
-	//   1. aggiungi il parametro queue *notify.Queue a shutdown e passalo
-	//      nella chiamata in fondo a run;
-	//   2. in shutdown, DOPO srv.Shutdown(ctx) e con lo stesso ctx, chiama
-	//      queue.Shutdown(ctx). Raccogli i due errori e restituiscili con
-	//      errors.Join, invece di uscire al primo: la coda va chiusa anche se
-	//      l'HTTP ha superato la deadline;
-	//   3. log.Info("shutdown complete", "notifications", queue.Stats()).
-	//   Perché quest'ordine? Le richieste HTTP ancora in corso possono
-	//   pubblicare: la coda deve restare aperta finché non sono finite. Il
-	//   pool del DB lo chiude il defer, per ultimo.
-	//
-	// Fatto quando: make test resta verde (i test di cmd/api avviano davvero
-	// run), un ticket creato produce "notification sent" nel log e Ctrl+C
-	// stampa "shutdown complete" con le statistiche.
-	ticketSvc := ticket.NewService(postgres.NewTicketRepo(pool), nil, log)
+	ticketSvc := ticket.NewService(postgres.NewTicketRepo(pool), queue, log)
 	handler := httpapi.NewHandler(httpapi.Deps{Auth: authSvc, Tickets: ticketSvc, DB: pool, Logger: log})
 	srv := httpapi.NewServer(cfg.HTTPAddr, handler, log)
 
@@ -142,20 +122,28 @@ func run(log *slog.Logger) error {
 	}
 	stop() // un secondo Ctrl+C termina subito il processo
 
-	return errors.Join(runErr, shutdown(log, cfg.ShutdownTimeout, srv))
+	return errors.Join(runErr, shutdown(log, cfg.ShutdownTimeout, srv, queue))
 }
 
-// shutdown smette di accettare richieste e attende quelle in corso, entro
-// la deadline. Il pool PostgreSQL viene chiuso dal defer in run, per ultimo.
-func shutdown(log *slog.Logger, timeout time.Duration, srv *http.Server) error {
+// shutdown chiude nell'ordine giusto, entro un'unica deadline:
+//  1. HTTP: nessuna nuova richiesta, attende quelle in corso
+//     (che possono ancora pubblicare notifiche);
+//  2. notifiche: chiude la coda e attende che i worker la svuotino.
+//
+// Il pool PostgreSQL viene chiuso dal defer in run, per ultimo.
+func shutdown(log *slog.Logger, timeout time.Duration, srv *http.Server, queue *notify.Queue) error {
 	// Un context NUOVO, con la sua deadline: quello di run è già stato
 	// cancellato dal segnale, e Shutdown non aspetterebbe nessuno.
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	var errs []error
 	if err := srv.Shutdown(ctx); err != nil {
-		return fmt.Errorf("http shutdown: %w", err)
+		errs = append(errs, fmt.Errorf("http shutdown: %w", err))
 	}
-	log.Info("shutdown complete")
-	return nil
+	if err := queue.Shutdown(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	log.Info("shutdown complete", "notifications", queue.Stats())
+	return errors.Join(errs...)
 }

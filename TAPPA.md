@@ -1,385 +1,231 @@
-# Tappa 5 — Worker pool e shutdown
+# Tappa 6 — Test e robustezza
 
 | Giorno | Durata | Branch | TODO |
 |---|---|---|---|
-| 2 | 50' | `tappa-5-notify` | NOTIFY-1 … NOTIFY-5 |
+| 2 | 50' | `tappa-6-robustezza` | ROB-1 |
 
 ## Prima di iniziare
 
 ```bash
-git switch -c lavoro/tappa-5 origin/tappa-5-notify
+git switch -c lavoro/tappa-6 origin/tappa-6-robustezza
 ```
 
 ## Obiettivo
 
-Prima si costruisce un worker pool **isolato**, senza HTTP né database. Poi lo si **integra** nel
-servizio: le notifiche partono dopo il commit, chi le pubblica non aspetta mai, e allo shutdown la
-coda viene svuotata nell'ordine giusto ed entro una deadline.
+Rendere rigoroso l'input JSON, poi vedere all'opera race detector e profiling sul codice scritto
+nelle tappe precedenti. Alla fine tutto è verde: unit test con `-race`, acceptance test e una demo
+end-to-end con `curl`.
 
 ## Da dove partiamo
 
-Il servizio funziona già per intero, ma senza notifiche: `main` passa `nil` come publisher a
-`ticket.NewService`. Il package `internal/notify` è nuovo, compila, ma `TryPublish` restituisce
-`TODO(NOTIFY-1)` e `Start`/`Shutdown` non fanno nulla.
+Il servizio è completo, notifiche comprese (la soluzione della tappa 5 è nel branch). Resta un punto
+debole: `decodeJSON`, usata da ogni handler con un body, accetta qualsiasi cosa:
+
+- qualunque `Content-Type`, anche nessuno;
+- campi sconosciuti, ignorati in silenzio: `"role":"agent"` nella register non dà errore, e il
+  client crede di aver chiesto qualcosa;
+- solo il primo valore: `{…}{…}` e `{…} x` passano;
+- body di qualunque dimensione, letti in memoria.
 
 Cosa trovi già pronto, e perché:
 
 | Già pronto | Perché non lo scrivi tu |
 |---|---|
-| `Queue`, `New`, `deliver`, `Stats`, `LogHandler` in `queue.go` | la struttura dati (channel, `RWMutex`, flag `closed`, `WaitGroup`, `cancel`, contatori atomici) e le parti senza concorrenza |
-| `Publisher` e `publish` in `internal/ticket/service.go` | l'interfaccia piccola che `*notify.Queue` soddisfa, e la costruzione della `Notification`; con `pub == nil` nessuna notifica |
-| `internal/notify/queue_test.go` | i test, anche con `testing/synctest`: orologio virtuale, deadline istantanee e deterministiche |
-| `internal/ticket/notify_test.go` | un publisher finto che registra le notifiche ricevute |
+| `requestError`, `badRequest`, `maxBodyBytes` in `json.go` | il tipo di errore che `respondErr` traduce in status e codice, e il limite di 64 KiB |
+| `jsonError` in `json.go` | traduce ogni errore di `encoding/json` in un messaggio utile; serve solo chiamarla |
+| `internal/httpapi/json_test.go` | il test, che usa la register come rotta pubblica |
+| `scripts/smoke.sh` (`make smoke`) | demo end-to-end con `curl`: 29 controlli su tutto il servizio |
+| `internal/auth/bench_test.go` | i benchmark di bcrypt e SHA-256 per il profiling |
 
 | ID | File | Cosa scrivi | Concetti Go |
 |---|---|---|---|
-| NOTIFY-1 | `internal/notify/queue.go` | `TryPublish` non bloccante e sicuro rispetto alla chiusura | `select` con `default`, `sync.RWMutex`, `atomic.Uint64` |
-| NOTIFY-2 | `internal/notify/queue.go` | `Start` e ciclo del worker | worker pool fisso, `context.WithCancel`, `sync.WaitGroup.Go`, `n, ok := <-ch` |
-| NOTIFY-3 | `internal/notify/queue.go` | `Shutdown` con deadline | chi chiude il channel, WaitGroup con timeout (goroutine + `done`), `select` sulla deadline |
-| NOTIFY-4 | `internal/ticket/service.go`, `claim.go` | `s.publish(...)` dopo create, claim e cambio di stato | effetti collaterali solo dopo il successo, best effort |
-| NOTIFY-5 | `cmd/api/main.go` | creare, avviare e passare la coda; chiuderla nello shutdown | ordine dello shutdown, un'unica deadline, `errors.Join` |
+| ROB-1 | `internal/httpapi/json.go` | `decodeJSON` rigoroso: 415, 413, campi sconosciuti, un solo valore | `mime.ParseMediaType`, `http.MaxBytesReader`, `json.Decoder`, `errors.Is`/`errors.As` |
 
-Due parti: **A** (NOTIFY-1…3, circa 22') si sviluppa solo contro i test del package `notify`;
-**B** (NOTIFY-4…5, circa 12') integra la coda nel servizio. I 16' restanti sono lavagna (8'
-all'inizio) ed evidenze collettive (8' alla fine).
+## Metodo di lavoro
 
-### Il percorso di una notifica
-
-```text
-POST /v1/tickets → Service.Create → store (COMMIT) → s.publish (NOTIFY-4)
-                                                       → queue.TryPublish (NOTIFY-1)
-                                                            │ non blocca mai: piena → scarta e conta
-                                                            ▼
-                               ┌─ worker 1 ─┐
-              q.ch (buffer) ──▶├─ worker 2 ─┤──▶ LogHandler: 200 ms, poi "notification sent"
-                               └─ worker N ─┘     (NOTIFY-2: N goroutine fisse)
-
-Ctrl+C → srv.Shutdown (HTTP) → queue.Shutdown (NOTIFY-3: chiude, svuota, deadline) → pool.Close
-```
-
-## Metodo di lavoro per ogni TODO
-
-Lo stesso ciclo delle tappe precedenti, con una differenza importante nella parte A:
+Lo stesso ciclo delle tappe precedenti:
 
 1. leggi **dove** viene chiamata la funzione e quale problema risolve;
-2. apri il relativo `_test.go`: nomi, input e risultati attesi sono il contratto;
-3. esegui il test mirato prima della modifica e leggi il primo fallimento;
-4. implementa un passo e rimuovi soltanto lo stub indicato;
-5. esegui di nuovo lo stesso test; poi passa al passo successivo;
-6. alla fine esegui `make test` e l'intero `make test-acceptance`.
+2. apri `json_test.go`: nomi, body, `Content-Type` e risultati attesi sono il contratto;
+3. esegui il test mirato prima della modifica e leggi i subtest rossi;
+4. implementa un passo del TODO alla volta e riesegui lo stesso test;
+5. alla fine esegui `make check` e l'intero `make test-acceptance`.
 
-Regole:
-
-- non modificare test, firme, campi di `Queue` o gli ID `TODO(...)`;
-- lancia sempre i test di `notify` con `-race`: un test concorrente senza race detector è a metà;
-- **fra NOTIFY-1 e NOTIFY-3 non lanciare l'intero package `notify`**. I tre TODO dipendono l'uno
-  dall'altro, e uno stato intermedio non fallisce in modo pulito:
-
-| Hai completato | `go test -tags acceptance -race ./internal/notify` | Perché |
-|---|---|---|
-| solo NOTIFY-1 | `TestShutdownDrainsPendingNotifications` resta bloccato fino al timeout | nessun worker consuma la coda |
-| NOTIFY-1 e 2, non il 3 | `panic: send on closed channel` | `Shutdown` non aspetta i worker: il test chiude il **suo** channel mentre loro ci scrivono ancora |
-| NOTIFY-1 e 3, non il 2 | `TestShutdownDrainsPendingNotifications` resta bloccato | come sopra: nessun worker |
-| NOTIFY-1, 2 e 3 | verde | — |
-
-Il secondo caso è istruttivo: è lo stesso panic che `TryPublish` deve evitare, provocato da chi
-chiude un channel mentre qualcun altro ci scrive.
+Regole: non modificare test, firme, `jsonError` o l'ID `TODO(ROB-1)`.
 
 ## Passo 0 — Ambiente e giro del codice (2')
 
 ```bash
 make test             # baseline verde
-make todo             # NOTIFY-1 … NOTIFY-5
-make test-acceptance  # 7 test rossi: quelli della tabella sotto
+make todo             # solo ROB-1
+make test-acceptance  # 1 test rosso: TestDecodeJSONHardening
 ```
 
-| File di test | Test rossi | Li sblocca |
-|---|---|---|
-| `internal/notify/queue_test.go` | `TestQueueDeliversEveryNotification`, `TestTryPublishWhenFullDropsWithoutBlocking`, `TestTryPublishAfterShutdownReturnsErrClosed`, `TestConcurrentPublishDuringShutdown`, `TestShutdownDrainsPendingNotifications`, `TestShutdownDeadlineCancelsWorkers` | NOTIFY-1 … NOTIFY-3 |
-| `internal/ticket/notify_test.go` | `TestPublishesAfterSuccess` | NOTIFY-4 |
+Contatore dei test rossi di `make test-acceptance`: 1 → **0** dopo ROB-1. Dentro quel test, 7
+subtest rossi su 9.
 
-Verdi già con lo stub, e devono restarlo: `TestWorkersStopWhenStartContextIsCancelled`,
-`TestNoPublishOnFailure`, `TestOperationsSucceedWhenQueueIsFull` (oltre a `TestNewValidatesArguments`
-e `TestLogHandlerRespectsCancellation`, che provano codice già scritto). NOTIFY-5 non ha test
-automatici: si verifica dal vivo.
-
-Contatore dei test rossi di `make test-acceptance`: 7 → **1** dopo NOTIFY-1…3 → **0** dopo
-NOTIFY-4.
-
-Leggi la struttura `Queue` in `queue.go`, in particolare il commento su `mu`: è il contratto fra
-`TryPublish` e `Shutdown`.
-
-## Parte A — il package `notify` da solo
-
-`internal/notify` non dipende da nulla del progetto. Si lavora solo con:
+## Passo 1 — ROB-1: `decodeJSON` rigoroso (18')
 
 ```bash
-go test -tags acceptance -race ./internal/notify     # non serve il database
+make test-acceptance RUN=TestDecodeJSONHardening
 ```
 
-### Passo 1 — NOTIFY-1: invio non bloccante (6')
+Ogni subtest manda un body alla register. La tabella dice cosa succede con lo stub e quale passo
+del TODO lo sistema:
 
-**Dove entra nel servizio.** `ticket.Service.publish` chiama `TryPublish` dopo ogni operazione
-riuscita. Chi chiama ha già fatto commit e sta rispondendo a una richiesta HTTP.
+| Subtest | Body / `Content-Type` | Con lo stub | Atteso | Lo sblocca |
+|---|---|---|---|---|
+| `charset parameter accepted` | valido, `application/json; charset=utf-8` | 201 | 201 | verde già con lo stub: deve restarlo |
+| `missing content type` | valido, nessun `Content-Type` | 201 | 415 `unsupported_media_type` | passo A |
+| `text/plain` | valido, `text/plain` | 201 | 415 `unsupported_media_type` | passo A |
+| `form encoded` | `email=a&password=b`, form | 400 `invalid_json` | 415 `unsupported_media_type` | passo A |
+| `unknown field` | `{…,"role":"agent"}` | 201 | 400 `unknown_field` | passo B (`DisallowUnknownFields`) |
+| `body too large` | un oggetto da 70 KiB | 201 | 413 `body_too_large` | passo B (`MaxBytesReader`) |
+| `two JSON values` | `{…}{…}` | 201 | 400 `invalid_json` | passo D |
+| `trailing garbage` | `{…} x` | 201 | 400 `invalid_json` | passo D |
+| `array instead of object` | `[]` | 400 `invalid_json` | 400 `invalid_json` | verde già con lo stub (`jsonError`) |
 
-**Perché serve.** Le notifiche sono *best effort*: se la coda è piena si scarta e si conta, ma la
-richiesta HTTP non deve mai aspettare né fallire per questo.
+Il passo C (il primo `Decode` con `jsonError`) c'è già nello stub, ma su un decoder creato al volo:
+va riscritto su `dec`, dopo i passi A e B.
 
-**Come svilupparlo.** Read lock, controllo di `closed`, invio con `select` e `default`.
+Due errori che il test **non** vede, perché il suo body da 70 KiB è un solo oggetto e quindi lo
+ferma già il primo `Decode`:
 
-| Stato della coda | `TryPublish` restituisce | Contatore |
-|---|---|---|
-| c'è posto nel buffer | `nil` | `published` + 1 |
-| buffer pieno | `ErrQueueFull`, **subito** | `dropped` + 1 |
-| `Shutdown` già chiamato | `ErrClosed` | nessuno |
+- nel passo D, l'errore del secondo `Decode` non controllato con `errors.As`: un oggetto valido
+  seguito da 70 KiB di spazi dà 400 invece di 413;
+- `dec.More()` al posto del secondo `Decode`: accetta un `}` o un `]` di troppo, e anche lui dà 400
+  invece di 413.
 
-**Perché un `RWMutex`.** Più produttori possono inviare insieme (read lock), ma nessuno mentre
-`Shutdown` chiude il channel (write lock). Senza lock, un invio può arrivare su un channel appena
-chiuso: `panic: send on closed channel`.
+Li trovi con le ultime due righe della tabella **Evidenze dal vivo**.
+
+## Passo 2 — Race detector (10')
+
+In `internal/notify/queue.go`, dentro `TryPublish`, commenta temporaneamente le due righe
+`q.mu.RLock()` e `defer q.mu.RUnlock()`, poi:
 
 ```bash
-# Il solo test del package che regge da solo: non avvia worker.
-make test-acceptance RUN=TestTryPublishWhenFullDropsWithoutBlocking
+go test -race -run TestConcurrentPublishDuringShutdown -count=20 ./internal/notify
 ```
 
-Errori frequenti:
+Atteso: il test fallisce, di solito con entrambi gli esiti nella stessa esecuzione.
 
-- `q.ch <- n` senza `select`/`default` → `TestTryPublishWhenFullDropsWithoutBlocking` resta
-  bloccato fino al timeout: a coda piena l'invio aspetta per sempre;
-- controllo di `q.closed` dimenticato → `panic: send on closed channel` (visibile dopo NOTIFY-3);
-- lock dimenticato → `WARNING: DATA RACE` in `TestConcurrentPublishDuringShutdown` (visibile dopo
-  NOTIFY-3, con `-race`).
+- `WARNING: DATA RACE`, anche due volte: la lettura di `q.closed` in `TryPublish` contro la
+  scrittura `q.closed = true` in `Shutdown`, e l'invio `q.ch <- n` contro `close(q.ch)`. Ogni
+  rapporto si legge dall'alto: l'accesso corrente (`Read at` / `Write at`), quello precedente
+  (`Previous write at` / `Previous read at`), poi dove sono nate le due goroutine. Le righe di
+  `queue.go` e `queue_test.go` sono quelle da guardare;
+- `panic: send on closed channel`: la race si è manifestata davvero.
 
-### Passo 2 — NOTIFY-2: worker pool (6')
+Poi ripristina il codice (togli i commenti, oppure `git restore internal/notify/queue.go`) e rilancia
+lo stesso comando: `ok`.
 
-**Dove entra nel servizio.** `main` chiama `Start` una sola volta all'avvio (NOTIFY-5).
+## Passo 3 — Profiling (10')
 
-**Perché serve.** Un numero fisso di goroutine consuma la coda, qualunque sia il traffico: niente
-goroutine per evento.
+```bash
+go test -run '^$' -bench . -benchmem ./internal/auth
+go test -run TestRegister -cpuprofile cpu.out ./internal/auth
+go tool pprof -top -nodecount=8 cpu.out
+rm -f cpu.out auth.test
+```
 
-**Come svilupparlo.** Passo A in `Start` (context cancellabile e N goroutine), passo B in `work`
-(il ciclo con `select`).
-
-| Il worker vede | Fa |
+| Comando | Cosa guardare |
 |---|---|
-| una notifica (`n, ok := <-q.ch` con `ok == true`) | `q.deliver(ctx, id, n)`, poi torna ad aspettare |
-| coda chiusa **e vuota** (`ok == false`) | `return` |
-| `ctx.Done()` (deadline di `Shutdown`, o ctx di `Start` cancellato) | `return`, anche se la coda non è vuota |
+| benchmark | `BenchmarkHashPassword` (bcrypt) nell'ordine delle decine di ms per operazione, `BenchmarkHashToken` (SHA-256) nelle decine di ns: circa sei ordini di grandezza. I numeri esatti dipendono dalla CPU |
+| `pprof -top` | in cima, con quasi tutto il tempo, `golang.org/x/crypto/blowfish.encryptBlock`: è il cuore di bcrypt. Più sotto `bcrypt.GenerateFromPassword` e `auth.(*Service).Register` |
 
-Dopo `close(q.ch)` il channel restituisce ancora tutto ciò che è nel buffer, e solo alla fine
-`ok == false`: per questo chiudere significa "svuota e poi esci", non "fermati".
+`-run '^$'` non corrisponde a nessun test: si eseguono solo i benchmark. Con `-cpuprofile`, `go
+test` lascia nella cartella corrente anche il binario del test, `auth.test`, che `.gitignore` non
+esclude: per questo l'ultimo comando lo cancella, insieme a `cpu.out`.
 
-Si verifica insieme a NOTIFY-3: senza `Shutdown` nessun test può aspettare i worker.
+Domanda: il login è lento, va ottimizzato? (Risposta in plenaria.)
 
-Errori frequenti:
-
-- `ctx, q.cancel := context.WithCancel(ctx)` → non compila: `non-name q.cancel on left side of
-  :=`. Un campo si assegna con `=`;
-- `for n := range q.ch` senza `select` su `ctx.Done()` → *nessun test lo scopre*: il worker non si
-  accorge della cancellazione, e se la coda non viene mai chiusa resta vivo per sempre;
-- `wg.Add` fatto dentro la goroutine (se non usi `wg.Go`) → race fra `Add` e `Wait`, a volte
-  segnalata da `-race`.
-
-### Passo 3 — NOTIFY-3: shutdown con deadline (10')
-
-**Dove entra nel servizio.** `main` chiama `Shutdown` dopo lo shutdown HTTP, con la stessa
-deadline; appena ritorna, chiude il pool PostgreSQL.
-
-**Perché serve.** Allo spegnimento le notifiche già accettate vanno consegnate, ma non all'infinito:
-oltre la deadline si interrompe, si conta e si esce.
-
-**Come svilupparlo.** A: chiudere la coda una volta sola, sotto lock. B: aspettare il WaitGroup in
-una goroutine che chiude `done`. C: `select` fra `done` e `ctx.Done()`.
-
-| Situazione | `Shutdown` | Dopo |
-|---|---|---|
-| prima chiamata | `closed = true`, `close(q.ch)` | i worker svuotano il buffer ed escono |
-| seconda chiamata | non chiude di nuovo (il flag) | `close` di un channel chiuso sarebbe `panic` |
-| worker finiti prima della deadline | `return nil` | — |
-| deadline scaduta | `q.cancel()`, poi `<-done`, poi errore con `len(q.ch)` e `ctx.Err()` | le notifiche rimaste sono perse |
-
-**Perché `<-done` anche dopo la deadline.** Quando `Shutdown` ritorna, `main` chiude il pool del
-database. Un worker ancora dentro un handler lavorerebbe su un pool chiuso. L'attesa è breve perché
-il contratto di `Handler` impone di rispettare `ctx`. Lo verifica `TestShutdownDeadlineCancelsWorkers`:
-il suo handler impiega 100 ms (dell'orologio finto) a fermarsi dopo la cancellazione, e il test
-controlla che il fallimento sia già contato quando `Shutdown` ritorna.
+## Passo 4 — Tutto verde (10')
 
 ```bash
-go test -tags acceptance -race ./internal/notify     # parte A completa: tutto verde
+make check               # fmt + vet + test-race: tutto ok
+make test-acceptance     # tutto ok
+make run                 # terminale 1
+make smoke               # terminale 2: "== 29 ok, 0 falliti"
 ```
 
-Errori frequenti:
-
-- flag `closed` dimenticato → `panic: close of closed channel` in
-  `TestTryPublishAfterShutdownReturnsErrClosed`, che chiama `Shutdown` due volte;
-- `close(q.ch)` senza lock → `WARNING: DATA RACE` in `TestConcurrentPublishDuringShutdown`;
-- `q.wg.Wait()` chiamato direttamente invece che in una goroutine → `panic: deadlock: all goroutines
-  in bubble are blocked` in `TestShutdownDeadlineCancelsWorkers`: la deadline non può più scattare;
-- `q.cancel()` chiamato subito invece che alla deadline → `TestQueueDeliversEveryNotification`
-  fallisce: le notifiche in coda non vengono consegnate;
-- `<-done` dimenticato dopo `q.cancel()` → `Failed = 0 right after Shutdown, want 1 (Shutdown must
-  wait for the workers)` in `TestShutdownDeadlineCancelsWorkers`: vedi sopra.
-
-## Parte B — integrazione
-
-### Passo 4 — NOTIFY-4: pubblicare dopo il successo (4')
-
-**Dove entra nel servizio.** In `Create`, `Claim` e `ChangeStatus`, dopo il controllo dell'errore
-dello store e prima del `return`.
-
-**Perché serve.** Lo store ha già fatto commit: notificare prima, o anche in caso di errore,
-annuncerebbe qualcosa che non è successo. Il rovescio della medaglia: un crash fra commit e
-`publish` perde la notifica (per garanzie servirebbe un'outbox: vedi `BACKLOG.md`).
-
-| Metodo | Chiamata |
-|---|---|
-| `Create` | `s.publish(ctx, EventCreated, t, actor.UserID)` |
-| `Claim` | `s.publish(ctx, EventClaimed, t, actor.UserID)` |
-| `ChangeStatus` | `s.publish(ctx, EventStatusChanged, t, actor.UserID)` |
-
-`publish` non restituisce errori: coda piena o chiusa diventano un WARN nel log, e l'operazione
-resta riuscita.
-
-```bash
-make test-acceptance RUN='TestPublishesAfterSuccess|TestNoPublishOnFailure|TestOperationsSucceedWhenQueueIsFull'
-make test-acceptance     # 0 rossi
-```
-
-Errori frequenti:
-
-- `publish` prima del controllo dell'errore → `TestNoPublishOnFailure`: `notifications published
-  for failed operations`;
-- `publish` dimenticato in un metodo, o con il `EventKind` sbagliato →
-  `TestPublishesAfterSuccess`: `notifications = [...], want [created claimed status_changed]`.
-
-### Passo 5 — NOTIFY-5: la coda in `main` (8')
-
-**Dove entra nel servizio.** `run` compone il servizio; `shutdown` lo spegne.
-
-**Perché serve.** È qui che si decide l'ordine di vita dei componenti: la coda deve esistere prima
-che arrivino richieste e deve chiudersi dopo l'ultima.
-
-**Come svilupparlo.** Passo A: `notify.New`, `queue.Start(context.Background())`, `queue` al posto
-di `nil`. Passo B: `shutdown` riceve la coda e la chiude dopo l'HTTP.
-
-| Ordine dello shutdown | Perché |
-|---|---|
-| 1. `srv.Shutdown(ctx)` | niente nuove richieste; quelle in corso possono ancora pubblicare |
-| 2. `queue.Shutdown(ctx)`, **stesso** `ctx` | la coda si chiude solo quando nessuno può più scriverci; un'unica deadline per tutto |
-| 3. `pool.Close()` (il `defer` in `run`) | i worker hanno finito: nessuno usa più il database |
-
-**Perché `context.Background()` in `Start`.** Il `ctx` di `run` viene cancellato al primo Ctrl+C:
-con quello i worker si fermerebbero subito, invece di svuotare la coda durante `Shutdown`.
-
-Nessun test automatico: `make test` deve restare verde (i test di `cmd/api` avviano davvero `run`),
-poi si verifica dal vivo.
-
-Errori frequenti, visibili solo dal vivo:
-
-- `queue.Start(ctx)` con il context del segnale → al Ctrl+C `"delivered":0` e notifiche perse
-  (misurato: 5 pubblicate, 0 consegnate, 4 fallite, 1 sparita senza log);
-- `nil` rimasto in `ticket.NewService` → nessun `notification sent` nel log;
-- coda chiusa prima dell'HTTP → una richiesta lenta ancora in corso riceve `queue closed` e perde
-  la notifica;
-- `return` al primo errore in `shutdown` → se l'HTTP sfora la deadline la coda non viene chiusa.
+`make smoke` richiede l'agent demo (`make seed`) e registra ogni volta utenti nuovi: si può
+rilanciare quante volte si vuole. Prima di ROB-1 finisce con `== 27 ok, 2 falliti`: sono
+`register con ruolo agent -> unknown_field` (201 invece di 400) e `body non JSON -> 415` (400
+invece di 415).
 
 ## Evidenze dal vivo
 
-Le variabili si passano **come argomenti di `make`**: `make run NOTIFY_WORKERS=1`. Scritte prima
-(`NOTIFY_WORKERS=1 make run`) vengono ignorate in silenzio, perché il `Makefile` legge `.env` e i
-suoi valori vincono sull'ambiente.
-
-Terminale 2, preparazione (riusa Ada delle tappe precedenti):
+Con `make run` nel terminale 1, nel terminale 2:
 
 ```bash
-B=http://localhost:8080
+B=http://localhost:8080/v1/auth/register
 J='Content-Type: application/json'
-T=$(curl -s -X POST $B/v1/auth/login -H "$J" -d '{"email":"ada@example.com","password":"correct-horse"}' \
-    | sed -E 's/.*"token":"([^"]+)".*/\1/')
-many() { for i in $(seq $1); do curl -s -o /dev/null -w '%{http_code} ' -X POST $B/v1/tickets \
-         -H "$J" -H "Authorization: Bearer $T" -d '{"title":"carico"}'; done; echo; }
+V='{"email":"rob1@example.com","password":"correct-horse"}'
+P=$(head -c 71680 /dev/zero | tr '\0' x)    # 70 KiB di "x"
 ```
 
-Se Ada non esiste: `curl -s -X POST $B/v1/auth/register -H "$J" -d
-'{"email":"ada@example.com","password":"correct-horse"}'`. Poi, per ogni prova, avvia il server nel
-terminale 1 come indicato e lancia `many N` nel terminale 2:
+"Accettato" vuol dire che il body è stato decodificato e la register è andata avanti: 201 la prima
+volta, poi 409 `email_taken`.
 
-| Terminale 1 | Terminale 2 | Risultato atteso |
+| Comando | Prima di ROB-1 | Dopo ROB-1 |
 |---|---|---|
-| `make run` | `many 1` | 201; dopo circa 200 ms il log `"msg":"notification sent","kind":"created"` |
-| `make run NOTIFY_QUEUE_SIZE=1 NOTIFY_WORKERS=1` | `many 10` | tutte 201; alcuni `WARN` `notification not queued` con `"err":"notify: queue full"`; al Ctrl+C `"dropped"` > 0 |
-| `make run NOTIFY_WORKERS=1`, Ctrl+C **subito dopo** | `many 5` | `shutdown signal received`, **poi** le 5 `notification sent` (la coda si svuota), poi `shutdown complete` con `"published":5,"delivered":5` |
-| `make run NOTIFY_WORKERS=1 SHUTDOWN_TIMEOUT=1s`, Ctrl+C subito dopo | `many 10` | circa 5 consegnate in 1 s, poi `queuedesk stopped` con `notify: shutdown interrupted with N notifications pending: context deadline exceeded`, exit code 1 |
-| qualsiasi, Ctrl+C | — | `shutdown complete` con `"notifications":{"published":…,"dropped":…,"delivered":…,"failed":…}` |
+| `curl -s $B -H 'Content-Type:' -d "$V"` | accettato | 415 `unsupported_media_type` |
+| `curl -s $B -H 'Content-Type: text/plain' -d "$V"` | accettato | 415 `unsupported_media_type` |
+| `curl -s $B -d 'email=a&password=b'` | 400 `malformed JSON at byte 1` | 415 `unsupported_media_type` |
+| `curl -s $B -H 'Content-Type: application/json; charset=utf-8' -d "$V"` | accettato | accettato |
+| `curl -s $B -H "$J" -d '{"email":"rob2@example.com","password":"correct-horse","role":"agent"}'` | 201 con `"role":"requester"`: il campo è ignorato | 400 `unknown_field`, `unknown field "role"` |
+| `curl -s $B -H "$J" -d "$V$V"` | accettato: registra il primo, ignora il secondo | 400 `body must contain a single JSON object` |
+| `curl -s $B -H "$J" -d "$V x"` | accettato | 400 `body must contain a single JSON object` |
+| `curl -s $B -H "$J" -d "{\"email\":\"rob3@example.com\",\"password\":\"$P\"}"` | 400 `invalid_input` (password oltre 72 byte): il body è stato letto tutto | 413 `body must not exceed 65536 bytes` |
+| `curl -s $B -H "$J" -d "$V}"` | accettato | 400 `body must contain a single JSON object` (con `dec.More()`: accettato) |
+| `curl -s $B -H "$J" -d "$V$(printf '%70000s' '')"` | accettato | 413 `body_too_large` (senza `errors.As` nel passo D: 400) |
 
 <details><summary>Aiuto — livello 1</summary>
 
-- Chi pubblica non deve mai aspettare: se non c'è posto si scarta e si conta.
-- Chiusura e invii vanno protetti dallo stesso mutex.
-- Un worker ha due motivi per uscire: coda chiusa e vuota, oppure context cancellato.
-- Ordine dello shutdown: chi produce notifiche deve fermarsi prima di chi le consuma.
+`encoding/json` è permissivo per default: ignora i campi sconosciuti e si ferma al primo valore.
+Quali opzioni del `Decoder` cambiano questo comportamento? E cosa deve restituire un secondo
+`Decode` se il body conteneva un solo oggetto?
 </details>
 
 <details><summary>Aiuto — livello 2</summary>
 
-- `select { case q.ch <- n: … default: … }` è l'invio non bloccante.
-- `sync.RWMutex`: `RLock` per gli invii (concorrenti fra loro), `Lock` per la chiusura.
-- `q.wg.Go(func() { … })` (Go 1.25) fa da solo `Add` e `Done`.
-- WaitGroup con deadline: una goroutine fa `wg.Wait(); close(done)` e tu fai `select` su `done` e
-  `ctx.Done()`.
-- In `main`: `queue.Start(context.Background())`, non il context del segnale.
+- `mime.ParseMediaType(r.Header.Get("Content-Type"))` restituisce il media type senza parametri.
+- `http.MaxBytesReader(w, r.Body, maxBodyBytes)` va assegnato a `r.Body` **prima** di
+  `json.NewDecoder(r.Body)`; poi `dec.DisallowUnknownFields()`.
+- Un secondo `dec.Decode(&struct{}{})` deve restituire `io.EOF`.
+- `jsonError` traduce già tutti gli errori, compreso `*http.MaxBytesError` → 413.
 </details>
 
-<details><summary>Aiuto — livello 3 (NOTIFY-2, passo B)</summary>
+<details><summary>Aiuto — livello 3 (passo D)</summary>
 
 ```go
-for {
-    select {
-    case <-ctx.Done():
-        return
-    case n, ok := <-q.ch:
-        if !ok {
-            return // coda chiusa e svuotata
-        }
-        q.deliver(ctx, id, n)
+if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+    var maxErr *http.MaxBytesError
+    if errors.As(err, &maxErr) {
+        return jsonError(err) // limite superato dopo il primo oggetto: 413
     }
+    return badRequest("invalid_json", "body must contain a single JSON object")
 }
+return nil
 ```
 </details>
 
-<details><summary>Aiuto — livello 3 (NOTIFY-3)</summary>
-
-```go
-q.mu.Lock()
-if !q.closed { q.closed = true; close(q.ch) }
-q.mu.Unlock()
-
-done := make(chan struct{})
-go func() { q.wg.Wait(); close(done) }()
-select {
-case <-done:
-    return nil
-case <-ctx.Done():
-    // cancella i worker, aspetta che escano (<-done),
-    // poi restituisci un errore che avvolge ctx.Err()
-}
-```
-</details>
-
-## Fine tappa
+## Fine laboratorio
 
 Prima del commit verifica questa checklist:
 
-- **NOTIFY-1**: `TryPublish` non blocca mai; coda piena → `ErrQueueFull`, coda chiusa →
-  `ErrClosed`; nessuna race con `Shutdown`;
-- **NOTIFY-2**: esattamente N worker; ognuno esce a coda chiusa e vuota oppure alla cancellazione;
-- **NOTIFY-3**: `Shutdown` idempotente; svuota la coda entro la deadline; oltre la deadline cancella,
-  aspetta i worker e restituisce un errore con `ctx.Err()`;
-- **NOTIFY-4**: una notifica per ogni operazione riuscita, nessuna per quelle fallite; una coda piena
-  non fa fallire le richieste;
-- **NOTIFY-5**: ordine HTTP → coda → database, un'unica deadline, statistiche nel log finale;
-- `make test`, `make test-race`, `make test-acceptance` e le prove della tabella **Evidenze dal
-  vivo** hanno l'esito atteso.
+- **ROB-1**: senza `Content-Type` JSON → 415, con `charset` → accettato; campi sconosciuti → 400
+  `unknown_field`; un solo valore JSON, altrimenti 400; oltre 64 KiB → 413, anche quando il limite
+  si supera dopo il primo oggetto;
+- il race detector ha trovato la race del Passo 2, e `queue.go` è tornato com'era;
+- nessun `auth.test` o `cpu.out` rimasto nella cartella;
+- `make check`, `make test-acceptance` e `make smoke` (29 ok) sono verdi.
 
-`make test-acceptance` verde, poi `git commit -am "tappa 5"` e passa alla tappa 6 con
-`git switch -c lavoro/tappa-6 origin/tappa-6-robustezza`.
+Quando il docente pubblica la soluzione completa, confrontala con il tuo lavoro:
+
+```bash
+git fetch origin soluzione:soluzione
+git diff lavoro/tappa-6 soluzione
+```
+
+Per proseguire: `BACKLOG.md`.

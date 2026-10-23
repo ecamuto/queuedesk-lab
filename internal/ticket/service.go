@@ -82,21 +82,9 @@ func (s *Service) Create(ctx context.Context, actor Actor, title, description st
 	if err != nil {
 		return Ticket{}, fmt.Errorf("create ticket: %w", err)
 	}
-	// TODO(NOTIFY-4) — Notificare la creazione, solo dopo il successo.
-	//
-	// Dove serve: s.publish (in fondo a questo file, già scritto) costruisce
-	// la notify.Notification per il reporter del ticket e chiama
-	// s.pub.TryPublish; con pub == nil, come in newService dei test, non fa
-	// nulla.
-	//
-	// Qui, dopo il controllo dell'errore dello store e prima del return:
-	//   s.publish(ctx, EventCreated, t, actor.UserID)
-	// Lo store ha già fatto commit: se avesse fallito non ci sarebbe nulla da
-	// notificare. publish non restituisce errori: coda piena o chiusa
-	// diventano un WARN nel log e la creazione resta riuscita (best effort).
-	// Lo stesso schema va in Claim e ChangeStatus (claim.go).
-	// Fatto quando: make test-acceptance RUN='TestPublishesAfterSuccess|TestNoPublishOnFailure|TestOperationsSucceedWhenQueueIsFull'
-	// (gli ultimi due sono verdi già con lo stub: devono restarlo).
+	// Solo dopo il successo dello store: se il commit fallisce non c'è nulla
+	// da notificare.
+	s.publish(ctx, EventCreated, t, actor.UserID)
 	return t, nil
 }
 

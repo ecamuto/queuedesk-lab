@@ -120,41 +120,41 @@ func New(size, workers int, h Handler, log *slog.Logger) (*Queue, error) {
 // i worker terminano subito, senza svuotare la coda: per uno shutdown
 // ordinato usare Shutdown e passare qui un context che non scade al segnale.
 func (q *Queue) Start(ctx context.Context) {
-	// TODO(NOTIFY-2, passo A) — Avviare esattamente q.workers goroutine.
-	//
-	// Dove serve: main chiama Start una sola volta all'avvio (NOTIFY-5); i
-	// test lo chiamano prima di pubblicare.
-	//
-	//   1. ctx, q.cancel = context.WithCancel(ctx): un context figlio che
-	//      Shutdown potrà cancellare con q.cancel quando scade la deadline. Con
-	//      "=" e non ":=": q.cancel è un campo, non una variabile nuova;
-	//   2. for id := range q.workers { q.wg.Go(func() { q.work(ctx, id) }) }.
-	//      sync.WaitGroup.Go (Go 1.25) fa Add prima di avviare la goroutine e
-	//      Done quando termina; da Go 1.22 ogni iterazione ha il suo id.
-	//
-	// Il numero di goroutine è fisso: nessuna goroutine per notifica.
-	// Fatto quando: si verifica insieme a NOTIFY-3 (vedi Shutdown).
+	// Go: WithCancel deriva da ctx un context figlio e restituisce la
+	// funzione che lo cancella. La salviamo in q.cancel: la userà Shutdown se
+	// la deadline scade. Cancellare il padre cancella anche il figlio, non
+	// il contrario.
+	ctx, q.cancel = context.WithCancel(ctx)
+
+	// Go: "range q.workers" su un intero (Go 1.22+) conta da 0 a workers-1.
+	// wg.Go (Go 1.25+) avvia la funzione in una goroutine e fa da solo
+	// wg.Add(1) prima e wg.Done() alla fine. Dalla 1.22 ogni iterazione ha la
+	// sua variabile id, quindi ogni closure vede il proprio valore.
+	for id := range q.workers {
+		q.wg.Go(func() { q.work(ctx, id) })
+	}
 }
 
 // work è il ciclo di un worker: prende notifiche dalla coda finché la coda
 // non è chiusa e vuota, oppure finché ctx non viene cancellato.
 func (q *Queue) work(ctx context.Context, id int) {
-	// TODO(NOTIFY-2, passo B) — Il ciclo di un worker.
-	//
-	// Un for senza condizione con dentro un select su due casi:
-	//   - <-ctx.Done(): cancellazione (deadline di Shutdown scaduta, oppure
-	//     ctx di Start cancellato) → return, anche se la coda non è vuota;
-	//   - n, ok := <-q.ch: ok == false vuol dire coda chiusa E vuota →
-	//     return; altrimenti q.deliver(ctx, id, n), già scritto qui sotto
-	//     (chiama l'handler e aggiorna delivered o failed).
-	//
-	// Dopo close(q.ch) il channel restituisce ancora tutto ciò che è nel
-	// buffer, e solo alla fine ok == false: per questo "chiudere" vuol dire
-	// "svuota e poi esci". Un for n := range q.ch da solo non basterebbe:
-	// non si accorgerebbe mai della cancellazione.
-	// Rimuovi la riga "_, _ = ctx, id".
-	// Fatto quando: si verifica insieme a NOTIFY-3 (vedi Shutdown).
-	_, _ = ctx, id
+	for {
+		// Go: select aspetta il primo case pronto. Se più case sono pronti
+		// insieme ne sceglie uno a caso. Un semplice "for n := range q.ch"
+		// non si accorgerebbe mai della cancellazione di ctx.
+		select {
+		case <-ctx.Done():
+			return
+		// Go: la ricezione con due valori distingue i due casi: ok è true se
+		// n è un valore vero, false se il channel è chiuso e il buffer è già
+		// vuoto (allora n è il valore zero di Notification).
+		case n, ok := <-q.ch:
+			if !ok {
+				return // coda chiusa e svuotata
+			}
+			q.deliver(ctx, id, n)
+		}
+	}
 }
 
 // deliver chiama l'handler e aggiorna i contatori.
@@ -171,31 +171,25 @@ func (q *Queue) deliver(ctx context.Context, worker int, n Notification) {
 // TryPublish accoda n senza bloccare. Restituisce ErrQueueFull se la coda
 // è piena, ErrClosed se Shutdown è già stato chiamato.
 func (q *Queue) TryPublish(n Notification) error {
-	// TODO(NOTIFY-1) — Invio non bloccante e sicuro rispetto alla chiusura.
-	//
-	// Dove serve: ticket.Service.publish chiama TryPublish dopo ogni create,
-	// claim o cambio di stato riuscito (NOTIFY-4). Chi chiama ha già fatto
-	// commit e sta rispondendo a una richiesta HTTP: non deve mai aspettare.
-	//
-	//   1. q.mu.RLock() e defer q.mu.RUnlock(): più produttori inviano in
-	//      parallelo fra loro, ma nessuno mentre Shutdown tiene il Lock
-	//      esclusivo per chiudere q.ch;
-	//   2. q.closed → return ErrClosed: inviare su un channel chiuso è panic;
-	//   3. invio non bloccante, con select e default:
-	//        select {
-	//        case q.ch <- n: // c'è posto nel buffer
-	//            q.published.Add(1); return nil
-	//        default:        // buffer pieno: si scarta, non si aspetta
-	//            q.dropped.Add(1); return ErrQueueFull
-	//        }
-	//
-	// Niente goroutine per singola notifica e niente invio bloccante: un
-	// q.ch <- n da solo si fermerebbe a coda piena. Rimuovi lo stub.
-	// Fatto quando: make test-acceptance RUN=TestTryPublishWhenFullDropsWithoutBlocking
-	// (non avvia worker: è il solo test del package che regge da solo). Non
-	// lanciare ancora l'intero package: senza NOTIFY-2 e NOTIFY-3 un test
-	// resta bloccato fino al timeout, o va in panic (vedi TAPPA.md).
-	return fmt.Errorf("TODO(NOTIFY-1) TryPublish: %w", errors.ErrUnsupported)
+	// Go: read lock + defer unlock. Più TryPublish possono girare in
+	// parallelo; Shutdown, che prende il Lock esclusivo, aspetta che escano
+	// tutti prima di chiudere il channel.
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	if q.closed {
+		return ErrClosed // inviare su un channel chiuso sarebbe un panic
+	}
+	// Go: un select con "default" non blocca mai. Se l'invio è possibile
+	// (c'è posto nel buffer) esegue quel case, altrimenti esegue subito
+	// default. È il modo idiomatico di fare un "prova a inviare".
+	select {
+	case q.ch <- n:
+		q.published.Add(1)
+		return nil
+	default:
+		q.dropped.Add(1)
+		return ErrQueueFull
+	}
 }
 
 // Shutdown smette di accettare notifiche, lascia che i worker svuotino la
@@ -203,39 +197,43 @@ func (q *Queue) TryPublish(n Notification) error {
 // escano e restituisce un errore che avvolge ctx.Err(). Quando Shutdown
 // ritorna nessun worker è più attivo. È sicuro chiamarlo più volte.
 func (q *Queue) Shutdown(ctx context.Context) error {
-	// TODO(NOTIFY-3) — Chiusura ordinata entro la deadline di ctx.
-	//
-	// Dove serve: main chiama Shutdown dopo lo shutdown HTTP, con la stessa
-	// deadline (NOTIFY-5); appena Shutdown ritorna, main chiude il pool
-	// PostgreSQL.
-	//
-	// Passo A — Chiudere la coda, una volta sola:
-	//   q.mu.Lock(); se !q.closed → q.closed = true e close(q.ch);
-	//   q.mu.Unlock(). Niente defer: il lock serve solo per queste righe, non
-	//   durante l'attesa dei worker. Il flag rende Shutdown idempotente:
-	//   chiudere due volte un channel è panic, e il test lo chiama due volte.
-	//
-	// Passo B — Attendere i worker con una deadline. wg.Wait non ha timeout,
-	// quindi lo si sposta in una goroutine che segnala la fine:
-	//      done := make(chan struct{})
-	//      go func() { q.wg.Wait(); close(done) }()
-	//
-	// Passo C — select fra fine del lavoro e deadline:
-	//   - <-done → return nil: coda svuotata, worker usciti;
-	//   - <-ctx.Done() → deadline scaduta:
-	//       1. se q.cancel != nil chiamalo (Start potrebbe non essere mai
-	//          stato chiamato): i worker vedono ctx.Done() ed escono;
-	//       2. <-done: aspetta comunque che escano. È breve, perché gli
-	//          Handler devono rispettare ctx, e serve a main, che subito dopo
-	//          chiude il pool del database;
-	//       3. return fmt.Errorf("notify: shutdown interrupted with %d
-	//          notifications pending: %w", len(q.ch), ctx.Err()).
-	//
-	// Rimuovi "_ = ctx" e il "return nil" provvisorio.
-	// Fatto quando: go test -tags acceptance -race ./internal/notify è verde
-	// (NOTIFY-1…3 insieme; non serve il database).
-	_ = ctx
-	return nil
+	// Go: qui niente defer: il lock serve solo per queste righe, non durante
+	// l'attesa dei worker. Chiudere due volte un channel è un panic: il flag
+	// closed rende Shutdown idempotente. Dopo close i worker ricevono
+	// ancora quello che resta nel buffer, poi ok == false.
+	q.mu.Lock()
+	if !q.closed {
+		q.closed = true
+		close(q.ch)
+	}
+	q.mu.Unlock()
+
+	// Go: wg.Wait blocca e non ha un timeout. Per poterlo mettere in un
+	// select contro la deadline lo spostiamo in una goroutine che, finita
+	// l'attesa, chiude done. chan struct{} non trasporta dati (struct{} occupa
+	// zero byte): serve solo come segnale, e chiuderlo "sveglia" chi riceve.
+	done := make(chan struct{})
+	go func() {
+		q.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		if q.cancel != nil {
+			q.cancel() // i worker vedono ctx.Done() e terminano
+		}
+		// Anche dopo la deadline si aspetta che i worker escano: chi chiama
+		// Shutdown (main) chiude subito dopo il pool del database, che un
+		// handler potrebbe ancora usare. L'attesa è breve perché gli handler
+		// devono rispettare la cancellazione di ctx (contratto di Handler).
+		<-done
+		// Go: len su un channel bufferizzato dice quanti elementi aspettano
+		// nel buffer in questo istante: qui, le notifiche mai consegnate.
+		return fmt.Errorf("notify: shutdown interrupted with %d notifications pending: %w", len(q.ch), ctx.Err())
+	}
 }
 
 // Stats restituisce una fotografia dei contatori.
