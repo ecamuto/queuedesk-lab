@@ -68,6 +68,31 @@ func (a *api) respondErr(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, auth.ErrUnauthenticated):
 		a.unauthorized(w)
 
+	// TODO(CLAIM-4) — Tradurre gli errori del claim in status HTTP.
+	//
+	// Dove serve: claimTicket e changeStatus passano qui ogni errore di Claim
+	// e ChangeStatus. Oggi finiscono nel default: 500 internal_error e una
+	// riga ERROR nel log.
+	//
+	// Aggiungi quattro case a questo switch, qui fra il 401 e il 404:
+	//   ticket.ErrForbidden         → 403, codice "forbidden", messaggio
+	//                                 "this operation requires the agent role"
+	//   ticket.ErrNotAssignee       → 403, codice "not_assignee", messaggio
+	//                                 "only the assigned agent can change the status"
+	//   ticket.ErrAlreadyClaimed    → 409, codice "already_claimed", messaggio
+	//                                 "ticket already claimed by another agent"
+	//   ticket.ErrInvalidTransition → 409, codice "invalid_transition", con
+	//                                 err.Error() come messaggio: dice da quale a
+	//                                 quale stato ("... open -> resolved") ed è
+	//                                 scritto da noi, quindi sicuro da mostrare
+	// Ogni case ha la forma: case errors.Is(err, ticket.ErrX): writeError(...).
+	//
+	// Usa errors.Is, non ==: gli errori arrivano avvolti da store e service
+	// ("claim ticket 7: ticket already claimed") e == confronta solo lo strato
+	// esterno. 403 = sei autenticato ma non puoi farlo; 409 = la richiesta è
+	// valida, ma lo stato attuale del ticket la impedisce.
+	// Fatto quando: make test-acceptance RUN=TestClaimErrorMapping.
+
 	// 404
 	case errors.Is(err, ticket.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "ticket not found")

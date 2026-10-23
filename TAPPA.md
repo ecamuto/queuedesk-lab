@@ -1,288 +1,318 @@
-# Tappa 3 — API ticket
+# Tappa 4 — Claim e transazioni
 
 | Giorno | Durata | Branch | TODO |
 |---|---|---|---|
-| 1 | 60' | `tappa-3-ticket` | TICKET-1 … TICKET-3 |
+| 2 | 60' (dopo 10' di ripresa) | `tappa-4-claim` | CLAIM-1 … CLAIM-4 |
 
 ## Prima di iniziare
 
 ```bash
-git switch -c lavoro/tappa-3 origin/tappa-3-ticket
-make db-up migrate-up   # se il DB era spento; le migrazioni non cambiano
-make seed               # se non l'hai già fatto in tappa 2: crea l'agent demo
+git switch -c lavoro/tappa-4 origin/tappa-4-claim
+make db-up migrate-up seed                          # se il DB è stato fermato ieri
+make seed SEED_AGENT_EMAIL=agent2@queuedesk.local   # un secondo agent, per le evidenze
 ```
+
+Si riparte tutti da qui: `origin/tappa-4-claim` contiene la soluzione ufficiale delle tappe 1–3,
+quindi chi ieri era rimasto indietro riparte allineato.
 
 ## Obiettivo
 
-Creare e leggere ticket rispettando la policy di visibilità. Il lavoro è tutto nel service: regole
-di dominio in Go puro, testate con un fake dello store, senza database. Alla fine due requester
-vedono ciascuno solo i propri ticket, un agent li vede tutti, e il ticket di un altro "non esiste".
+Due agent che fanno claim dello stesso ticket nello stesso istante: **esattamente uno vince**.
+Poi le transizioni di stato, riservate all'agent assegnato, e la traduzione dei nuovi errori in
+403 e 409.
 
 ## Da dove partiamo
 
-Il branch contiene la soluzione delle tappe 1 e 2: login, `/v1/me` e logout funzionano. Le quattro
-rotte dei ticket sono già registrate e protette da `requireAuth`, ma il service risponde
+Le due rotte nuove sono già registrate e protette da `requireAuth`, ma rispondono
 `501 not_implemented`:
 
 | Richiesta, oggi | Risposta |
 |---|---|
-| `POST /v1/tickets` | 501 `TODO(TICKET-1) Create: unsupported operation` |
-| `GET /v1/tickets` | 501 `TODO(TICKET-2) List: unsupported operation` |
-| `GET /v1/tickets/{id}` | 501 `TODO(TICKET-3) Get: unsupported operation` |
-| `GET /v1/tickets/{id}/events` | 501 `TODO(TICKET-3) Events: unsupported operation` |
+| `POST /v1/tickets/{id}/claim` | 501 `TODO(CLAIM-2) Claim: unsupported operation` |
+| `PATCH /v1/tickets/{id}/status` | 501 `TODO(CLAIM-3) ChangeStatus: unsupported operation` |
 
 Cosa trovi già pronto, e perché:
 
 | Già pronto | Perché non lo scrivi tu |
 |---|---|
-| `internal/ticket/ticket.go` | modello, errori, `ParseStatus`, limiti, **la policy di visibilità nel commento del package** |
-| interfaccia `Store` in `service.go` | il contratto verso la persistenza: lo dichiara il service, che lo usa |
-| `internal/ticket/fakes_test.go` | `fakeStore`: uno `Store` in memoria che registra le chiamate e l'ultimo filtro |
-| `internal/httpapi/ticket_handlers.go` | rotte, DTO, `actor()` (principal → `ticket.Actor`), lettura di `{id}` |
-| `respondErr` in `internal/httpapi/errors.go` | `ErrInvalidInput` → 400, `ErrNotFound` → 404, tutto il resto → 500 |
-| `internal/postgres/tickets.go` | il repository completo: si **legge** a fine tappa (5'), non si scrive |
+| errori in `internal/ticket/claim.go` | `ErrForbidden`, `ErrNotAssignee`, `ErrAlreadyClaimed`, `ErrInvalidTransition`: il vocabolario |
+| `UpdateStatus` in `internal/postgres/claim.go` | la stessa garanzia con un lock pessimistico (`SELECT … FOR UPDATE`): da leggere e confrontare |
+| `internal/httpapi/claim_handlers.go` | handler di claim e cambio di stato |
+| `internal/ticket/claim_fakes_test.go` | `ClaimTicket` e `UpdateStatus` del fake, per testare il service senza DB |
+| `internal/postgres/claim_test.go` | il test concorrente con la barriera: da leggere con la classe |
 
 | ID | File | Cosa scrivi | Concetti Go |
 |---|---|---|---|
-| TICKET-1 | `internal/ticket/service.go` | `Create` con validazione | `strings.TrimSpace`, rune contro byte (`utf8.RuneCountInString`), `%w` con un sentinella in testa |
-| TICKET-2 | `internal/ticket/service.go` | `List`: filtro, `limit`, scope per ruolo | da stringhe grezze a valori tipizzati, `strconv.Atoi`, struct confrontabili con `==` |
-| TICKET-3 | `internal/ticket/service.go` | `Get`, `Events`: policy di visibilità | errori di dominio, `errors.Is` lungo la catena, riuso invece di duplicazione |
+| CLAIM-1 | `internal/postgres/claim.go` | `ClaimTicket`: UPDATE condizionale in transazione | `pgx.Tx`, `defer tx.Rollback`, `RETURNING`, `pgx.ErrNoRows`, atomicità delegata al DB |
+| CLAIM-2 | `internal/ticket/claim.go` | `Claim`: prima il ruolo, poi lo store | errori sentinella, `%w`, separazione service/store |
+| CLAIM-3 | `internal/ticket/claim.go` | `CanTransition`, `ChangeStatus` | `switch` senza `break`, conversione validata (`ParseStatus`) |
+| CLAIM-4 | `internal/httpapi/errors.go` | errori del claim → 403/409 | `switch` senza espressione, `errors.Is` contro `==` |
 
-Ordine consigliato: TICKET-1 → TICKET-2 → TICKET-3, tutti con unit test sul fake, senza avviare
-nulla. Poi evidenze dal vivo con `curl`. I 23' restanti sono lavagna (8' all'inizio), lettura
-guidata del repository (5') ed evidenze collettive (10' alla fine).
+Ordine consigliato: CLAIM-1 (l'unico che richiede PostgreSQL) → CLAIM-2 → CLAIM-3 → CLAIM-4. I
+16' restanti sono lavagna (10' all'inizio) ed evidenze collettive (6' alla fine).
 
-### Chi fa cosa
+### Il percorso di un claim
 
 ```text
-POST /v1/tickets {"title": "...", "description": "..."}
-  → requireAuth → createTicket (handler: JSON, Actor dal principal)
-      → Service.Create (TICKET-1: trim, validazione, ReporterID = actor)
-          → Store.CreateTicket (postgres: INSERT ticket + evento "created", una transazione)
-  ← 201 Location: /v1/tickets/<id>
-
-GET /v1/tickets/{id}
-  → requireAuth → getTicket → Service.Get (TICKET-3: policy)
-      → Store.TicketByID
-  ← 200 ticket, oppure 404 se non esiste o non è tuo
+POST /v1/tickets/{id}/claim
+  → requireAuth → claimTicket (handler)
+      → Service.Claim (CLAIM-2: requester? 403 senza toccare il DB)
+          → TicketRepo.ClaimTicket (CLAIM-1: BEGIN; UPDATE ... WHERE assignee_id IS NULL;
+                                    evento "claimed"; COMMIT)
+  ← 200 ticket assegnato, oppure un errore che respondErr (CLAIM-4) traduce in 403/404/409
 ```
 
-Il service non conosce HTTP né SQL: riceve un `Actor`, restituisce dati o errori di dominio.
-Solo `httpapi/errors.go` decide quale status corrisponde a quale errore.
+La concorrenza la risolve PostgreSQL, non Go: nessun mutex. Le richieste concorrenti possono
+arrivare anche da più istanze del servizio, e un `sync.Mutex` proteggerebbe un processo solo.
 
 ## Metodo di lavoro per ogni TODO
 
-Lo stesso ciclo delle tappe 1 e 2:
+Lo stesso ciclo delle tappe precedenti:
 
 1. leggi **dove** viene chiamata la funzione e quale problema risolve;
-2. apri `internal/ticket/service_test.go`: nomi, input e risultati attesi sono il contratto;
+2. apri il relativo `_test.go`: nomi, input e risultati attesi sono il contratto;
 3. esegui il test mirato prima della modifica e leggi il primo fallimento;
-4. implementa un solo passo A/B e rimuovi soltanto lo stub indicato;
+4. implementa un solo passo e rimuovi soltanto lo stub indicato;
 5. esegui di nuovo lo stesso test; poi passa al passo successivo;
 6. alla fine esegui `make test` e l'intero `make test-acceptance`.
 
 Regole:
 
-- non modificare test, fake, firme delle funzioni, l'interfaccia `Store` o gli ID `TODO(...)`;
-- aggiungi gli import quando servono (`strings`, `unicode/utf8`, `strconv`); quando togli l'ultimo
-  stub togli anche `"errors"`, che non serve più: Go non accetta import inutilizzati;
-- scrivi tutto dentro la funzione del TODO: la soluzione ufficiale non usa funzioni di supporto;
-- i messaggi di validazione arrivano al client: usa quelli indicati nei TODO.
+- non modificare test, fake, firme, l'interfaccia `Store` o gli ID `TODO(...)`;
+- in `ClaimTicket` ogni query usa `tx`, mai `r.pool`;
+- un test concorrente verde una volta non dimostra nulla: ripetilo (comando in CLAIM-1);
+- gli import in questi file servono già ad altro codice: non devi aggiungerne né toglierne.
 
 ## Passo 0 — Ambiente e giro del codice (2')
 
 ```bash
 make test             # baseline verde
-make todo             # TICKET-1 … TICKET-3
-make test-acceptance  # 4 test rossi, tutti in internal/ticket/service_test.go
+make todo             # CLAIM-1 … CLAIM-4
+make test-acceptance  # 7 test rossi: quelli della tabella sotto
 ```
 
-| Test rosso | Lo sblocca |
-|---|---|
-| `TestCreateValidation`, `TestStoreErrorsAreWrapped` | TICKET-1 |
-| `TestListFilter` | TICKET-2 |
-| `TestGetVisibility` | TICKET-3 (passi A e B) |
+| File di test | Test rossi | Li sblocca |
+|---|---|---|
+| `internal/postgres/claim_test.go` | `TestClaimConcurrentSingleWinner`, `TestClaimErrors` | CLAIM-1 |
+| `internal/postgres/claim_test.go` | `TestUpdateStatus` | CLAIM-1 (prepara i dati) e CLAIM-3 (`CanTransition`) |
+| `internal/ticket/claim_test.go` | `TestClaim` | CLAIM-2 |
+| `internal/ticket/claim_test.go` | `TestCanTransition`, `TestChangeStatus` | CLAIM-3 |
+| `internal/httpapi/claim_handlers_test.go` | `TestClaimErrorMapping` | CLAIM-4 |
 
-Contatore dei test rossi di `make test-acceptance` mentre procedi: 4 → **2** dopo TICKET-1 →
-**1** dopo TICKET-2 → **0** dopo TICKET-3.
+Contatore dei test rossi di `make test-acceptance` mentre procedi: 7 → **5** dopo CLAIM-1 →
+**4** dopo CLAIM-2 → **1** dopo CLAIM-3 → **0** dopo CLAIM-4.
 
-Leggi il commento del package in `internal/ticket/ticket.go` (la policy) e `fakes_test.go`:
-`calls` registra i metodi invocati, `lastF` l'ultimo `ListFilter` ricevuto, `err` simula un guasto.
+## Passo 1 — CLAIM-1: l'UPDATE atomico (20')
 
-## Passo 1 — TICKET-1: creazione con validazione (13')
+**Dove entra nel servizio.** `Service.Claim` (CLAIM-2) chiama `ClaimTicket` dopo aver controllato
+il ruolo. È l'unico punto del sistema che assegna un ticket.
 
-**Dove entra nel servizio.** `createTicket` decodifica il JSON, ricava l'`Actor` dal principal e
-chiama `Create`. Un `ErrInvalidInput` diventa 400 con `err.Error()` come messaggio; un ticket
-creato diventa 201 con l'header `Location`.
+**Perché serve.** È il cuore del laboratorio. Due agent cliccano "prendo io" nello stesso istante:
+uno solo deve vincere, l'altro deve ricevere 409, e nell'audit deve comparire **un solo** evento
+`claimed`.
 
-**Perché serve.** La validazione è una regola di dominio: deve valere qualunque sia il canale
-(HTTP oggi, una CLI domani). Il CHECK nel database resta l'ultima difesa, ma darebbe un errore SQL
-generico (500); il service dà un 400 con un messaggio utile, e senza nemmeno interrogare il DB.
+**Come svilupparlo.** Prima disegna la race, poi scrivi quattro passi: transazione, UPDATE
+condizionale, distinzione delle due cause di "zero righe", evento e commit.
 
-**Come svilupparlo.** Passo A normalizza e valida, passo B salva. Tra i due c'è un confine netto:
-con un input non valido lo store non va chiamato.
+### La race di "controlla e poi aggiorna"
 
-### Regole di validazione
+```text
+A: SELECT assignee_id → NULL
+B: SELECT assignee_id → NULL
+A: UPDATE ... SET assignee_id = A   ✔
+B: UPDATE ... SET assignee_id = B   ✔  ← sovrascrive A: due vincitori, due eventi
+```
 
-| Campo | Normalizzazione | Valido | Errore |
-|---|---|---|---|
-| `title` | `strings.TrimSpace` | da 1 a `MaxTitleLen` (200) **caratteri** | `invalid input: title must be between 1 and 200 characters` |
-| `description` | `strings.TrimSpace` | da 0 a `MaxDescriptionLen` (5000) caratteri | `invalid input: description must be at most 5000 characters` |
-| `ReporterID` | — | sempre `actor.UserID` | non viene mai dal body |
+Con la condizione **dentro** l'UPDATE (`WHERE id = $1 AND assignee_id IS NULL`), "controlla e
+scrivi" diventa un'operazione sola. Chi arriva secondo si blocca sul lock della riga; quando il
+primo fa commit, PostgreSQL (READ COMMITTED) **rivaluta la WHERE** sulla versione nuova della riga,
+trova `assignee_id` valorizzato e aggiorna zero righe.
 
-### Byte contro caratteri
+### Contratto di `ClaimTicket`
 
-`len("é")` vale 2: `len` conta i **byte** della codifica UTF-8. `utf8.RuneCountInString("é")` vale
-1: conta i **caratteri** (rune). Il CHECK SQL usa `char_length`, cioè caratteri, e il test
-`title exactly max length` usa 200 volte `é` (400 byte): con `len` viene rifiutato.
+| Situazione | UPDATE | Dopo | Restituisce | HTTP |
+|---|---|---|---|---|
+| ticket libero, arrivi primo | 1 riga (`RETURNING`) | evento `claimed`, `Commit` | ticket assegnato | 200 |
+| ticket già assegnato (anche a te) | 0 righe → `pgx.ErrNoRows` | `SELECT EXISTS` → `true` | `ticket.ErrAlreadyClaimed` | 409 |
+| ticket inesistente | 0 righe → `pgx.ErrNoRows` | `SELECT EXISTS` → `false` | `ticket.ErrNotFound` | 404 |
+| errore del DB | — | `Rollback` (dal `defer`) | `claim ticket: ...: <errore>` | 500 |
 
-### Il sentinella in testa
+Il `SELECT EXISTS` si fa **solo dopo** un UPDATE fallito e nella stessa transazione. Prima
+dell'UPDATE non serve nulla: leggere `assignee_id` e decidere in Go riaprirebbe la race, e un
+`EXISTS` preliminare sarebbe solo una query in più anche per chi vince.
 
-`fmt.Errorf("%w: title must be ...", ErrInvalidInput)` mette `ErrInvalidInput` **dentro** la catena
-e il dettaglio nel testo. `respondErr` lo riconosce con `errors.Is` e risponde 400; un
-`errors.New("title must be ...")` avrebbe lo stesso testo ma nessun sentinella: diventerebbe 500.
+### Il test concorrente
+
+`assertSingleWinner` in `internal/postgres/claim_test.go`, da leggere:
+
+- ogni goroutine chiama `ready.Done()` e poi si blocca su `<-start`;
+- il test aspetta `ready.Wait()` (tutte pronte), poi `close(start)`: un canale chiuso sblocca
+  **tutte** le goroutine in attesa nello stesso istante;
+- verifica: esattamente un vincitore, gli altri `ErrAlreadyClaimed`, un solo evento `claimed`,
+  assegnatario = vincitore; con 2 e 8 agent, per 10 round.
+
+Niente `time.Sleep`: rallenterebbe il test e comunque non garantirebbe la sovrapposizione.
 
 ### Sviluppo e test incrementali
 
 ```bash
-# Passo A: trim, conteggio in rune, sentinella, store non chiamato.
-make test-acceptance RUN=TestCreateValidation
-make test-acceptance RUN='TestCreateValidation/title_exactly_max_length'
+# Passi A–D: richiede PostgreSQL (make db-up).
+make test-acceptance RUN=TestClaimErrors
+make test-acceptance RUN=TestClaimConcurrentSingleWinner
 
-# Passo B: l'errore dello store arriva avvolto e riconoscibile.
-make test-acceptance RUN=TestStoreErrorsAreWrapped
+# Ripeti il test concorrente 20 volte: un risultato verde singolo non basta.
+TEST_DATABASE_URL='postgres://queuedesk:queuedesk@localhost:55432/queuedesk_test?sslmode=disable' \
+  go test -tags acceptance -race -count=20 -run TestClaimConcurrentSingleWinner ./internal/postgres
 ```
 
 Errori frequenti:
 
-- `len(title)` → `title_exactly_max_length` fallisce con `want <nil>`;
-- `TrimSpace` dimenticato sul titolo → `valid,_trimmed` riceve il titolo con gli spazi e
-  `blank_title` viene accettato;
-- store chiamato prima di validare → `store called with invalid input`;
-- `errors.New(...)` o `fmt.Errorf` senza `%w: ...` → `Create error = title must be ..., want invalid
-  input`;
-- `%v` invece di `%w` per l'errore dello store → `does not wrap the store error`;
-- `ReporterID` dimenticato → `unexpected ticket {... ReporterID: ...}`;
-- `TrimSpace` dimenticato sulla description → *nessun test lo scopre*: rileggi la tabella.
+- `SELECT assignee_id` e poi `UPDATE` → `N winners [...], want exactly 1`: nelle nostre prove è
+  rosso 20 volte su 20, ma una race può anche nascondersi, per questo si ripete con `-count=20`;
+- `pgx.ErrNoRows` non gestito → `unexpected error claim ticket: update: no rows in result set`;
+- nessuna distinzione fra le due cause → con sempre `ErrAlreadyClaimed` il ticket inesistente dà
+  409 (`TestClaimErrors`); con sempre `ErrNotFound` i perdenti ricevono `unexpected error ticket
+  not found`;
+- `tx.Commit` dimenticato → `8 winners [...]`: ogni transazione viene annullata dal `defer`, chi
+  aspettava il lock ritrova `assignee_id` NULL e "vince" anche lui, ma nel DB non resta nulla;
+- evento scritto con `r.pool` invece di `tx` → *nessun test lo scopre*: un crash fra le due query
+  lascerebbe un claim senza evento.
 
-## Passo 2 — TICKET-2: lista con filtro e scope (12')
+**Confronto con `UpdateStatus`.** Subito sotto, `UpdateStatus` risolve lo stesso problema con un
+lock pessimistico: `SELECT … FOR UPDATE` blocca la riga, il codice Go verifica assegnatario e
+transizione, poi aggiorna. Due query e un lock più lungo, ma regole arbitrarie in Go. Conviene
+quando la decisione non si esprime in una WHERE.
 
-**Dove entra nel servizio.** `listTickets` passa a `List` le stringhe grezze di `?status=` e
-`?limit=`. Il risultato diventa `{"tickets": [...]}`, sempre una lista, anche vuota.
+## Passo 2 — CLAIM-2: il claim nel service (6')
 
-**Perché serve.** La query string è input non fidato. Il service la trasforma in un `ListFilter`
-tipizzato e validato, così lo store riceve solo valori già controllati. E decide lui, non il client,
-quali ticket può vedere un requester.
+**Dove entra nel servizio.** L'handler `claimTicket` passa a `Claim` l'`Actor` ricavato dal
+principal e l'`{id}` del path.
 
-**Come svilupparlo.** Passo A costruisce il filtro partendo dai default; passo B interroga lo store
-solo se il filtro è valido.
+**Perché serve.** Il ruolo è una regola di dominio: la verifica il service, prima di qualsiasi
+query. L'atomicità invece è un problema di dati: la garantisce lo store.
 
-### Contratto di `List`
+**Come svilupparlo.** Quattro righe: controllo del ruolo, chiamata allo store, `%w`, return.
 
-| Actor | `q.Status` | `q.Limit` | `ListFilter` passato allo store, oppure errore |
+| Actor | Ticket | Store chiamato? | `Claim` restituisce |
 |---|---|---|---|
-| requester `req-1` | `""` | `""` | `{ReporterID: "req-1", Limit: 20}` |
-| agent | `""` | `""` | `{Limit: 20}`: `ReporterID` vuoto = tutti |
-| agent | `resolved` | `5` | `{Status: "resolved", Limit: 5}` |
-| requester | `""` | `100` | `{ReporterID: "req-1", Limit: 100}` |
-| qualsiasi | `closed` | — | `invalid input: status must be one of open, in_progress, resolved` |
-| qualsiasi | — | `0`, `101`, `ten` | `invalid input: limit must be an integer between 1 and 100` |
+| requester | qualsiasi | **no** | `ErrForbidden` |
+| agent | libero | sì | ticket con `AssigneeID` = agent |
+| agent | già assegnato | sì | `claim ticket <id>: ticket already claimed` |
+| agent | inesistente | sì | `claim ticket <id>: ticket not found` |
 
-`TestListFilter` confronta il filtro ricevuto dal fake con `!=`: si può fare perché `ListFilter`
-contiene solo campi confrontabili (stringhe e un intero). Un campo diverso, anche uno solo, e il
-test mostra `filter = {...}, want {...}`.
+Non aggiungere un controllo in Go come `TicketByID` seguito da `if t.AssigneeID != nil`:
+reintrodurrebbe la race che CLAIM-1 elimina.
 
-**Perché `ReporterID` lo imposta il server.** Non esiste un parametro `?reporter_id=`, e se
-esistesse verrebbe sovrascritto: per un requester lo scope è una regola, non una preferenza.
+```bash
+make test-acceptance RUN='^TestClaim$'
+```
+
+Errori frequenti:
+
+- ruolo controllato dopo lo store → `store called = true, want false`;
+- controllo "già assegnato" in Go con un errore inventato → `Claim error = ticket 1 already
+  assigned, want ticket already claimed`;
+- `%v` invece di `%w` → `Claim error = claim ticket 1: ticket already claimed, want ticket already
+  claimed`: il testo contiene l'errore giusto, ma la catena è spezzata.
+
+## Passo 3 — CLAIM-3: transizioni di stato (10')
+
+**Dove entra nel servizio.** `PATCH /v1/tickets/{id}/status` → `changeStatus` → `ChangeStatus`
+(passo B) → `UpdateStatus` nel repository, che sotto lock chiama `CanTransition` (passo A).
+
+**Perché serve.** Il ciclo di vita del ticket è una regola di dominio: deve stare in un posto solo,
+testabile senza database, e applicata dove lo stato non può cambiare sotto i piedi.
+
+**Come svilupparlo.** Passo A è uno `switch`; passo B ripete lo schema di `Claim` con una
+conversione validata in mezzo.
+
+### Transizioni ammesse
+
+```text
+open ──▶ in_progress ──▶ resolved
+  ▲          │  ▲            │
+  └──────────┘  └────────────┘
+```
+
+| Da \ A | `open` | `in_progress` | `resolved` |
+|---|---|---|---|
+| `open` | no | **sì** | no |
+| `in_progress` | **sì** | no | **sì** |
+| `resolved` | no | **sì** | no |
+
+Restare nello stesso stato non è una transizione; uno stato sconosciuto non transita mai. Il claim
+assegna ma non cambia lo stato, e nessuna transizione tocca l'assegnatario: un ticket rimesso in
+`open` resta dell'agent che ne ha fatto claim.
+
+### Chi controlla cosa in `ChangeStatus`
+
+| Controllo | Dove | Errore | HTTP |
+|---|---|---|---|
+| ruolo agent | service, prima di tutto | `ErrForbidden` | 403 |
+| stato valido (`"done"`?) | service, con `ParseStatus` | `ErrInvalidInput` | 400 |
+| sei l'assegnatario? | store, dopo `FOR UPDATE` | `ErrNotAssignee` | 403 |
+| transizione ammessa? | store, dopo `FOR UPDATE`, con `CanTransition` | `ErrInvalidTransition` | 409 |
+
+Assegnatario e transizione non si controllano nel service: fra il controllo e l'UPDATE lo stato
+potrebbe cambiare. Sotto `FOR UPDATE` non può.
 
 ### Sviluppo e test incrementali
 
 ```bash
-# Default e scope per ruolo.
-make test-acceptance RUN='TestListFilter/(requester_sees_only_own|agent_sees_all)'
+# Passo A: le 9 coppie di stati più uno stato sconosciuto.
+make test-acceptance RUN=TestCanTransition
 
-# Validazione di status e limit.
-make test-acceptance RUN='TestListFilter/(unknown_status|limit_zero|limit_too_big|limit_not_a_number)'
+# Passo B: ruolo, ParseStatus, store (il fake usa CanTransition).
+make test-acceptance RUN=TestChangeStatus
 
-# Tutto.
-make test-acceptance RUN=TestListFilter
+# Con PostgreSQL: claim, transizioni ed eventi in sequenza.
+make test-acceptance RUN=TestUpdateStatus
 ```
 
 Errori frequenti:
 
-- `ReporterID` non impostato → `requester_sees_only_own` e `max_limit` falliscono con
-  `filter = {ReporterID: ...}, want {ReporterID:req-1 ...}`;
-- partire da `ListFilter{}` → `Limit:0` invece di 20;
-- solo il controllo `n > MaxListLimit` → `limit_zero` viene accettato;
-- `Status(q.Status)` senza `ParseStatus` → `unknown_status` arriva allo store.
+- `return true` come default dello `switch` → `TestCanTransition` segnala tutte le coppie sbagliate;
+- `in_progress → open` dimenticata → `CanTransition(in_progress, open) = false, want true`;
+- `Status(status)` invece di `ParseStatus` → `invalid_status_value`: `"done"` arriva allo store e
+  diventa `status transition not allowed` (409) invece di `invalid input` (400).
 
-## Passo 3 — TICKET-3: visibilità di ticket ed eventi (10')
+## Passo 4 — CLAIM-4: errori → status HTTP (6')
 
-**Dove entra nel servizio.** `getTicket` chiama `Get`; `ticketEvents` chiama `Events`. Entrambi
-ricevono `{id}` già convertito in intero dall'handler (`/v1/tickets/abc` risponde 400 `invalid_id`
-prima di arrivare qui).
+**Dove entra nel servizio.** `respondErr` è l'unico punto che traduce errori di dominio in status
+HTTP. Oggi i quattro errori nuovi finiscono nel `default`: 500 `internal_error` e una riga ERROR
+nel log. Lo vedi dal vivo se completi CLAIM-1…3 prima di CLAIM-4: chi perde il claim riceve 500.
 
-**Perché serve.** È la regola di sicurezza della tappa: un requester non deve leggere i ticket
-altrui, e non deve nemmeno scoprire quali ID esistono.
+**Perché serve.** 403 dice "sei autenticato, ma non puoi farlo"; 409 dice "la richiesta è valida,
+ma lo stato attuale del ticket la impedisce". Un client li gestisce in modo diverso.
 
-**Come svilupparlo.** Passo A scrive la policy in `Get`; passo B la riusa in `Events`.
+**Come svilupparlo.** Quattro `case errors.Is(...)` nello `switch` senza espressione.
 
-### Policy di visibilità
-
-| Actor | Ticket | `Get` / `Events` | HTTP |
+| Errore | Status | Codice | Messaggio |
 |---|---|---|---|
-| agent | qualsiasi esistente | ticket / eventi | 200 |
-| requester | aperto da lui | ticket / eventi | 200 |
-| requester | aperto da un altro | `ErrNotFound` | **404** |
-| qualsiasi | inesistente | `ErrNotFound` (dallo store) | 404 |
-| qualsiasi | store guasto | `get ticket <id>: <errore>` | 500 |
+| `ticket.ErrForbidden` | 403 | `forbidden` | `this operation requires the agent role` |
+| `ticket.ErrNotAssignee` | 403 | `not_assignee` | `only the assigned agent can change the status` |
+| `ticket.ErrAlreadyClaimed` | 409 | `already_claimed` | `ticket already claimed by another agent` |
+| `ticket.ErrInvalidTransition` | 409 | `invalid_transition` | `err.Error()`: dice da quale a quale stato |
 
-**Perché 404 e non 403.** Le righe 3 e 4 producono **lo stesso identico body**. Con un 403 per il
-ticket altrui, un requester che prova gli ID 1, 2, 3… scoprirebbe quali esistono e quanti ticket ci
-sono. Il package non ha nemmeno un `ErrForbidden` in questa tappa: arriverà con il claim.
-
-**`%w` lungo la catena.** Lo store restituisce `ErrNotFound`; `Get` lo avvolge in
-`get ticket 42: ticket not found`; `respondErr` lo ritrova con `errors.Is` → 404. Con `%v` il
-testo sarebbe **identico**, ma la catena spezzata: `errors.Is` restituirebbe `false` e il client
-riceverebbe 500.
-
-### Sviluppo e test incrementali
+**`errors.Is` e non `==`.** L'errore arriva avvolto da store e service: `claim ticket 7: ticket
+already claimed`. `==` confronta solo lo strato esterno e fallisce; `errors.Is` risale la catena
+creata da `%w`.
 
 ```bash
-# Passo A da solo: questo caso chiama soltanto Get.
-make test-acceptance RUN='TestGetVisibility/missing_ticket'
-
-# Passi A e B: owner, agent, altro requester, per Get e per Events.
-make test-acceptance RUN=TestGetVisibility
-
-# Fine tappa.
-make test-acceptance
+make test-acceptance RUN=TestClaimErrorMapping
+make test-acceptance            # fine tappa: 0 rossi
 ```
 
 Errori frequenti:
 
-- `%v` invece di `%w` in `Get` → `Get error = get ticket 42: ticket not found, want ErrNotFound`:
-  il messaggio sembra giusto, il tipo no;
-- controllo di visibilità dimenticato → `Get error = <nil>, want ticket not found`;
-- `Events` che non passa da `Get` → `Events error = <nil>, want ticket not found`: un requester
-  leggerebbe l'audit altrui;
-- `errors.New("forbidden")` → non è `ErrNotFound`: test rosso e, dal vivo, 500;
-- import `"errors"` lasciato dopo l'ultimo stub → `"errors" imported and not used`.
-
-## Lettura guidata — `postgres/tickets.go` (5')
-
-Non è un TODO. Due cose da guardare:
-
-- **`CreateTicket`**: `Begin` → `defer tx.Rollback(ctx)` → INSERT del ticket → INSERT dell'evento
-  `created` → `Commit`. Il `Rollback` dopo un `Commit` riuscito non fa nulla, per questo si può
-  differire sempre: qualunque `return` di errore annulla tutto. Ogni query usa `tx`, non `r.pool`.
-- **`ListTickets`**: la WHERE cresce con `args = append(args, valore)` e
-  `fmt.Sprintf("reporter_id = $%d", len(args))`. Nella stringa SQL entrano solo frammenti scritti da
-  noi e segnaposto `$1, $2…`; i valori viaggiano separati, quindi niente SQL injection.
+- `err == ticket.ErrAlreadyClaimed` → `claim_conflict`: `status = 500, want 409`;
+- status sbagliato → `status = 400, want 409`;
+- messaggio fisso invece di `err.Error()` per `invalid_transition` → *nessun test lo scopre*: il
+  test controlla solo status e codice, ma il client perde l'informazione "da quale a quale stato".
 
 ## Evidenze dal vivo
 
-Terminale 1: `make run`. Terminale 2:
+Terminale 1: `make run`. Terminale 2 (i due agent li hai creati in "Prima di iniziare"):
 
 ```bash
 B=http://localhost:8080
@@ -290,111 +320,88 @@ J='Content-Type: application/json'
 login() { curl -s -X POST $B/v1/auth/login -H "$J" -d "{\"email\":\"$1\",\"password\":\"$2\"}" \
           | sed -E 's/.*"token":"([^"]+)".*/\1/'; }
 
-# Due requester (409 email_taken se esistono già: va bene) e l'agent demo.
-curl -s -X POST $B/v1/auth/register -H "$J" -d '{"email":"ada@example.com","password":"correct-horse"}'
-curl -s -X POST $B/v1/auth/register -H "$J" -d '{"email":"bob@example.com","password":"correct-horse"}'
+curl -s -o /dev/null -X POST $B/v1/auth/register -H "$J" \
+     -d '{"email":"ada@example.com","password":"correct-horse"}'          # 409 se esiste già: va bene
 ADA=$(login ada@example.com correct-horse)
-BOB=$(login bob@example.com correct-horse)
 AGENT=$(login agent@queuedesk.local agent-demo-password)
-
-curl -si -X POST $B/v1/tickets -H "$J" -H "Authorization: Bearer $ADA" -d '{"title":"  VPN down  "}'
+AGENT2=$(login agent2@queuedesk.local agent-demo-password)
 ID=$(curl -s -X POST $B/v1/tickets -H "$J" -H "Authorization: Bearer $ADA" \
-     -d '{"title":"Stampante"}' | sed -E 's/.*"id":([0-9]+).*/\1/')
-curl -s -X POST $B/v1/tickets -H "$J" -H "Authorization: Bearer $BOB" -d '{"title":"Mouse rotto"}'
+     -d '{"title":"Claim conteso"}' | sed -E 's/.*"id":([0-9]+).*/\1/')
 
-curl -s $B/v1/tickets -H "Authorization: Bearer $BOB"            # solo i ticket di Bob
-curl -si $B/v1/tickets/$ID -H "Authorization: Bearer $BOB"       # ticket di Ada visto da Bob
-curl -s $B/v1/tickets/999999 -H "Authorization: Bearer $BOB"     # ticket inesistente
-curl -s "$B/v1/tickets?status=open" -H "Authorization: Bearer $AGENT"
-curl -s $B/v1/tickets/$ID/events -H "Authorization: Bearer $ADA"
+# Due agent, due claim nello stesso istante: 200 e 409, in qualsiasi ordine.
+for T in $AGENT $AGENT2; do
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST $B/v1/tickets/$ID/claim -H "Authorization: Bearer $T" &
+done; wait
+
+curl -s -X POST $B/v1/tickets/$ID/claim -H "Authorization: Bearer $ADA"            # requester
+for T in $AGENT $AGENT2; do                                                          # chi ha vinto?
+  curl -s -o /dev/null -w '%{http_code} ' -X PATCH $B/v1/tickets/$ID/status -H "$J" \
+       -H "Authorization: Bearer $T" -d '{"status":"resolved"}'
+done; echo
+
+for S in in_progress resolved; do                                                    # solo il vincitore
+  for T in $AGENT $AGENT2; do
+    curl -s -o /dev/null -w '%{http_code} ' -X PATCH $B/v1/tickets/$ID/status -H "$J" \
+         -H "Authorization: Bearer $T" -d "{\"status\":\"$S\"}"
+  done; echo
+done
+curl -s $B/v1/tickets/$ID/events -H "Authorization: Bearer $ADA" | grep -o '"kind":"[a-z_]*"'
 ```
 
 | Prova | Risultato atteso |
 |---|---|
-| `POST /v1/tickets` con `"  VPN down  "` | 201, header `Location: /v1/tickets/<id>`, `"title":"VPN down"` (spazi tolti), `"status":"open"`, `"assignee_id":null` |
-| titolo vuoto o di soli spazi | 400 `invalid_input`, `title must be between 1 and 200 characters` |
-| `?limit=1000`, `?limit=abc` oppure `?status=closed` | 400 `invalid_input` con il messaggio della tabella di TICKET-2 |
-| Bob: `GET /v1/tickets` | solo `Mouse rotto` |
-| Bob: `GET /v1/tickets/$ID` (di Ada) e `GET /v1/tickets/999999` | **lo stesso identico body** 404 `not_found` |
-| Bob: `GET /v1/tickets/$ID/events` | 404 anche per l'audit |
-| `GET /v1/tickets/abc` | 400 `invalid_id` (lo decide l'handler, non il service) |
-| agent: `GET /v1/tickets?status=open` | i ticket di Ada **e** di Bob |
-| Ada: `GET /v1/tickets/$ID/events` | un evento `"kind":"created"` con `"payload":{"title":"Stampante"}` |
-| un requester senza ticket: `GET /v1/tickets` | `{"tickets":[]}`, non `null` |
+| due claim simultanei di due agent | `200` e `409`, in qualsiasi ordine |
+| claim con il token di Ada (requester) | 403 `forbidden` |
+| `resolved` su un ticket `open` | `409` dall'agent assegnato (`invalid_transition`), `403` dall'altro (`not_assignee`) |
+| `in_progress`, poi `resolved` | `200` per il vincitore, `403` per l'altro, due volte |
+| `GET …/events` | `created`, `claimed`, `status_changed`, `status_changed`: **un solo** `claimed` |
+| log di `make run` | nessuna riga ERROR: 403 e 409 non sono errori del server |
 
-Nel DB (`make db-psql`): `SELECT ticket_id, kind, payload FROM ticket_events ORDER BY id;` mostra un
-evento `created` per ogni ticket, scritto nella stessa transazione del ticket.
+Ripeti il blocco più volte: il vincitore cambia, la forma del risultato no.
 
 <details><summary>Aiuto — livello 1</summary>
 
-- Il service valida e applica la policy; il repository parla solo SQL.
-- Prima si valida, poi si chiama lo store: un input non valido non deve arrivare al database.
-- Il filtro di un requester lo decide il server.
-- Un requester non deve neppure sapere che un ticket altrui esiste.
+Disegna su una linea del tempo due agent che eseguono "leggi assignee; se è vuoto, aggiorna".
+Dove si rompe? Cosa deve fare il database perché non vincano entrambi?
 </details>
 
 <details><summary>Aiuto — livello 2</summary>
 
-- `strings.TrimSpace` e `utf8.RuneCountInString` (non `len`: "è" sono 2 byte).
-- Errori di validazione: `fmt.Errorf("%w: title must be between 1 and %d characters", ErrInvalidInput, MaxTitleLen)`.
-- Errori dello store: `fmt.Errorf("create ticket: %w", err)`.
-- `List`: parti da `ListFilter{Limit: DefaultListLimit}`; `ParseStatus` esiste già;
-  `strconv.Atoi(q.Limit)` più il controllo `1..MaxListLimit`.
-- Requester: `f.ReporterID = actor.UserID`, imposto dal server.
-- `Events`: chiama prima `s.Get`, poi `s.store.ListEvents`.
+- Metti la condizione dentro l'UPDATE stesso: `WHERE id = $1 AND assignee_id IS NULL`. Con
+  `RETURNING` sai subito se hai vinto (una riga) o perso (`pgx.ErrNoRows`).
+- Zero righe ha due cause: le distingui con `SELECT EXISTS (...)` **nella stessa transazione**.
+- Service: prima il ruolo, poi lo store; gli errori dello store avvolti con `%w`.
+- `CanTransition`: uno `switch from` con un `return` per ogni stato.
+- CLAIM-4: `errors.Is` segue la catena di `%w`; un confronto con `==` fallirebbe sull'errore
+  avvolto.
 </details>
 
-<details><summary>Aiuto — livello 3 (TICKET-2, passo A)</summary>
+<details><summary>Aiuto — livello 3 (CLAIM-1)</summary>
 
 ```go
-f := ListFilter{Limit: DefaultListLimit}
-if q.Status != "" {
-    st, err := ParseStatus(q.Status)
-    if err != nil {
-        return nil, err
-    }
-    f.Status = st
+t, err := scanTicket(tx.QueryRow(ctx, `UPDATE tickets SET assignee_id = $2, updated_at = now()
+    WHERE id = $1 AND assignee_id IS NULL RETURNING `+ticketColumns, id, agentID))
+if errors.Is(err, pgx.ErrNoRows) {
+    var exists bool
+    // tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tickets WHERE id = $1)`, id).Scan(&exists)
+    // !exists → ticket.ErrNotFound ; exists → ticket.ErrAlreadyClaimed
 }
-if q.Limit != "" {
-    n, err := strconv.Atoi(q.Limit)
-    if err != nil || n < 1 || n > MaxListLimit {
-        return nil, fmt.Errorf("%w: limit must be an integer between 1 and %d", ErrInvalidInput, MaxListLimit)
-    }
-    f.Limit = n
-}
-if !actor.IsAgent {
-    f.ReporterID = actor.UserID
-}
+// altro err → "claim ticket: update: %w"; poi insertEvent(..., ticket.EventClaimed, ...) → tx.Commit(ctx)
 ```
 </details>
 
-<details><summary>Aiuto — livello 3 (TICKET-3)</summary>
-
-```go
-t, err := s.store.TicketByID(ctx, id)
-if err != nil {
-    return Ticket{}, fmt.Errorf("get ticket %d: %w", id, err)
-}
-if !actor.IsAgent && t.ReporterID != actor.UserID {
-    // ErrNotFound, non "forbidden": un requester non scopre che il ticket esiste
-    return Ticket{}, fmt.Errorf("get ticket %d: %w", id, ErrNotFound)
-}
-return t, nil
-```
-</details>
-
-## Fine giornata 1
+## Fine tappa
 
 Prima del commit verifica questa checklist:
 
-- **TICKET-1**: titolo e descrizione senza spazi ai bordi; lunghezze contate in caratteri; un
-  input non valido dà 400 senza toccare lo store; gli errori dello store restano riconoscibili;
-- **TICKET-2**: default 20, limite 1–100, stato validato; un requester vede solo i propri ticket
-  qualunque cosa chieda;
-- **TICKET-3**: ticket altrui e ticket inesistente danno lo stesso 404, anche per gli eventi;
-  l'agent vede tutto;
+- **CLAIM-1**: un solo UPDATE condizionale, nessun SELECT preliminare; 404 e 409 distinti dopo,
+  nella stessa transazione; evento `claimed` solo per il vincitore; il test concorrente resta
+  verde con `-count=20`;
+- **CLAIM-2**: un requester riceve 403 senza query; gli errori dello store restano riconoscibili;
+- **CLAIM-3**: solo le quattro transizioni ammesse; uno stato non valido dà 400, non 409;
+- **CLAIM-4**: 403 e 409 con `errors.Is`; `invalid_transition` dice da quale a quale stato;
 - `make test`, `make test-race`, `make test-acceptance` e le prove della tabella **Evidenze dal
   vivo** hanno l'esito atteso.
 
-`make test-acceptance` verde, poi `git commit -am "tappa 3"`. Domani si riparte tutti da
-`git switch -c lavoro/tappa-4 origin/tappa-4-claim`, che contiene la soluzione delle tappe 1–3.
+`make test-acceptance` verde, poi `git commit -am "tappa 4"` e passa alla tappa 5 con
+`git switch -c lavoro/tappa-5 origin/tappa-5-notify`.

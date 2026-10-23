@@ -30,6 +30,8 @@ type TicketService interface {
 	Create(ctx context.Context, actor ticket.Actor, title, description string) (ticket.Ticket, error)
 	List(ctx context.Context, actor ticket.Actor, q ticket.ListQuery) ([]ticket.Ticket, error)
 	Get(ctx context.Context, actor ticket.Actor, id int64) (ticket.Ticket, error)
+	Claim(ctx context.Context, actor ticket.Actor, id int64) (ticket.Ticket, error)
+	ChangeStatus(ctx context.Context, actor ticket.Actor, id int64, status string) (ticket.Ticket, error)
 	Events(ctx context.Context, actor ticket.Actor, id int64) ([]ticket.Event, error)
 }
 
@@ -88,6 +90,8 @@ func NewHandler(d Deps) http.Handler {
 	mux.Handle("POST /v1/tickets", a.requireAuth(a.createTicket))
 	mux.Handle("GET /v1/tickets", a.requireAuth(a.listTickets))
 	mux.Handle("GET /v1/tickets/{id}", a.requireAuth(a.getTicket))
+	mux.Handle("POST /v1/tickets/{id}/claim", a.requireAuth(a.claimTicket))
+	mux.Handle("PATCH /v1/tickets/{id}/status", a.requireAuth(a.changeStatus))
 	mux.Handle("GET /v1/tickets/{id}/events", a.requireAuth(a.ticketEvents))
 
 	// Go: *http.ServeMux soddisfa l'interfaccia http.Handler (ha il metodo
